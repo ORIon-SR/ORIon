@@ -1,0 +1,60 @@
+{
+  "input_path": "apod_data\\images",
+  "seed": 0,
+  "requested_fractions": {
+    "train": 0.85,
+    "val": 0.05,
+    "test": 0.1
+  },
+  "actual_counts": {
+    "train": 2130,
+    "val": 125,
+    "test": 251
+  },
+  "actual_fractions": {
+    "train": 0.85,
+    "val": 0.0499,
+    "test": 0.1002
+  },
+  "total_images": 2506,
+  "image_size_stats_by_split": {
+    "train": {
+      "width": {
+        "min": 827,
+        "median": 2196.5,
+        "max": 14391
+      },
+      "height": {
+        "min": 575,
+        "median": 1923.5,
+        "max": 9131
+      }
+    },
+    "val": {
+      "width": {
+        "min": 1028,
+        "median": 2172,
+        "max": 6140
+      },
+      "height": {
+        "min": 1024,
+        "median": 1924,
+        "max": 4257
+      }
+    },
+    "test": {
+      "width": {
+        "min": 987,
+        "median": 2048,
+        "max": 9714
+      },
+      "height": {
+        "min": 979,
+        "median": 1777,
+        "max": 8826
+      }
+    }
+  },
+  "input_pool_sha256": "32b9f8650e4c9e7c6400a13030b8c522a4def5c558084c6309af6fad38bbe56f",
+  "split_unit": "image"
+}
