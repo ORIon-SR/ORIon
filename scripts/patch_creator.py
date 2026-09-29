@@ -102,7 +102,6 @@ def select_patches(
 def process_split(
     split_name: str,
     records: list[tuple[Path, int, int]],
-    base_dir: Path,
     output_dir: Path,
     patch_size: int,
     downscale_factor: int | None,
@@ -115,8 +114,7 @@ def process_split(
 
     total = 0
     skipped = 0
-    for img_rel, w, h in records:
-        img_path = base_dir / img_rel
+    for img_path, w, h in records:
         if not img_path.exists():
             print(f"  warning: {img_path} not found, skipping", file=sys.stderr)
             skipped += 1
@@ -168,12 +166,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--input-dir",
-        default="apod_data/images",
-        type=Path,
-        help="Where to load baseline images from.",
-    )
-    parser.add_argument(
         "--output-dir",
         default="apod_data/dataset",
         type=Path,
@@ -207,7 +199,6 @@ def main(argv: list[str] | None = None):
         n = process_split(
             split_name,
             records,
-            args.input_dir,
             args.output_dir,
             args.patch_size,
             args.downscale_factor,
