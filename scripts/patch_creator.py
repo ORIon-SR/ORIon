@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+"""Extract fixed-size HR patches from APOD train/val/test splits.
+
+Patches are sampled randomly per image, with a texture filter (min standard
+deviation) to prefer informative regions. The number of patches per image
+scales with image area. Images smaller than the patch size are skipped.
+
+Optionally produces LR patches via bicubic downsampling for super-resolution
+training pairs.
+
+Usage:
+    python scripts/patch_creator.py \
+        --input-dir apod_data/images \
+        --output-dir apod_data/dataset \
+        --patch-size 512 \
+        --downscale-factor 4
+"""
 
 import argparse
 import sys
