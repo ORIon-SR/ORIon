@@ -183,11 +183,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="If set, also produce LR patches by bicubic downsampling.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Set seed for deterministic patch extraction",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None):
     args = parse_args(argv)
+    np.random.seed(args.seed)
 
     grand_total = 0
     for split_name in SPLIT_NAMES:
