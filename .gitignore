@@ -225,3 +225,4 @@ apod_data/*.tar.gz
 
 *.pth
 .python-version
+*/results/
