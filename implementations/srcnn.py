@@ -255,6 +255,7 @@ def main() -> None:
     parser.add_argument("--save-path", type=Path, default="checkpoints/srcnn_best.pth", help="Path to save best model")
     parser.add_argument("--preview-dir", type=Path, default="previews/scnn", help="Directory to save preview images")
     parser.add_argument("--num-previews", type=int, default=5, help="Number of preview samples to save")
+    parser.add_argument("--scaling-factor", type=int, default=16, help="Factor by which to upscale LR images")
     args = parser.parse_args()
 
     rank, world_size, device = setup_ddp()
@@ -293,7 +294,7 @@ def main() -> None:
         test_dataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=4, pin_memory=True
     )
 
-    model = SRCNN().to(device)
+    model = SRCNN(upscale_factor=args.scaling-factor).to(device)
     model = DDP(model, device_ids=[device.index])
 
     if is_main:
