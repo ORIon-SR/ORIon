@@ -246,8 +246,11 @@ def setup_ddp() -> tuple[int, int, torch.device]:
 
 
 def main() -> None:
+    project_root = Path(__file__).resolve().parent.parent
+    default_data_dir = project_root / "apod_data" / "dataset"
+
     parser = argparse.ArgumentParser(description="Train SRCNN for super-resolution")
-    parser.add_argument("--data-dir", type=Path, default="apod_data/dataset", help="Dataset root directory")
+    parser.add_argument("--data-dir", type=Path, default=default_data_dir, help="Dataset root directory")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU")
