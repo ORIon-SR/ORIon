@@ -110,7 +110,7 @@ def save_preview(
     combined.paste(hr_pil, (width * 2, 0))
 
     combined.save(save_path / f"preview_{idx:03d}_epoch{epoch:03d}.png")
-    wandb.log({f"preview/{idx}": wandb.Image(combined, caption=f"LR | SR | HR - sample {idx} (epoch {epoch})")})
+    wandb.log({f"preview/{idx}": wandb.Image(combined, caption=f"LR | SR | HR - sample {idx} (epoch {epoch})")}, step=epoch)
 
 
 def generate_previews(
@@ -224,7 +224,8 @@ def train(
                     "val/mae": val_mae,
                     "val/ssim": val_ssim,
                     "epochs_without_improvement": patience_counter,
-                }
+                },
+                step=epoch,
             )
 
             raw_model = model.module if isinstance(model, DDP) else model
