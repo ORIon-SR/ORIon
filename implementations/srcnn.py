@@ -1,0 +1,270 @@
+import argparse
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import wandb
+from PIL import Image
+from torch.utils.data import DataLoader
+
+from dataloader import SRDataset
+
+
+class ResBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
+class SRCNN(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        base_channels: int = 64,
+        num_blocks: int = 8,
+        upscale_factor: int = 4,
+    ):
+        super().__init__()
+        self.upscale_factor = upscale_factor
+
+        self.shallow = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+
+        blocks = []
+        for _ in range(num_blocks):
+            blocks.append(ResBlock(base_channels))
+        self.body = nn.Sequential(*blocks)
+
+        self.upscale = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels * upscale_factor**2, 3, padding=1),
+            nn.PixelShuffle(upscale_factor),
+            nn.ReLU(inplace=True),
+        )
+
+        self.final = nn.Conv2d(base_channels, out_channels, 3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.shallow(x)
+        x = x + self.body(x)
+        x = self.upscale(x)
+        return self.final(x)
+
+
+def compute_ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> float:
+    C1 = 0.01**2
+    C2 = 0.03**2
+
+    img1 = img1.unsqueeze(0)
+    img2 = img2.unsqueeze(0)
+
+    channels = img1.size(1)
+    window = torch.ones(channels, 1, window_size, window_size, device=img1.device)
+    window = window / (window_size**2)
+
+    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channels)
+    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channels)
+
+    mu1_sq = mu1**2
+    mu2_sq = mu2**2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1**2, window, padding=window_size // 2, groups=channels) - mu1_sq
+    sigma2_sq = F.conv2d(img2**2, window, padding=window_size // 2, groups=channels) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channels) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean().item()
+
+
+def save_preview(lr_img: torch.Tensor, sr_img: torch.Tensor, hr_img: torch.Tensor, save_path: Path, idx: int) -> None:
+    def to_pil(tensor: torch.Tensor) -> Image.Image:
+        arr = tensor.clamp(0, 1).mul(255).byte().cpu().numpy()
+        arr = np.transpose(arr, (1, 2, 0))
+        return Image.fromarray(arr)
+
+    lr_pil = to_pil(lr_img)
+    sr_pil = to_pil(sr_img)
+    hr_pil = to_pil(hr_img)
+
+    lr_up = lr_pil.resize(hr_pil.size, Image.Resampling.BICUBIC)
+
+    width, height = hr_pil.size
+    combined = Image.new("RGB", (width * 3, height))
+    combined.paste(lr_up, (0, 0))
+    combined.paste(sr_pil, (width, 0))
+    combined.paste(hr_pil, (width * 2, 0))
+
+    combined.save(save_path / f"preview_{idx:03d}.png")
+    wandb.log({f"preview/{idx}": wandb.Image(combined, caption=f"LR | SR | HR - sample {idx}")})
+
+
+def generate_previews(
+    model: nn.Module,
+    test_loader: DataLoader,
+    device: torch.device,
+    preview_dir: Path,
+    num_previews: int,
+) -> None:
+    model.eval()
+    preview_count = 0
+
+    with torch.no_grad():
+        for lr_imgs, hr_imgs in test_loader:
+            lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
+            outputs = model(lr_imgs)
+
+            for i in range(outputs.size(0)):
+                if preview_count >= num_previews:
+                    break
+                save_preview(lr_imgs[i], outputs[i], hr_imgs[i], preview_dir, preview_count)
+                preview_count += 1
+
+            if preview_count >= num_previews:
+                break
+
+    print(f"Generated {preview_count} preview images in {preview_dir}")
+
+
+def train(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    patience: int,
+    save_path: Path,
+) -> None:
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_loss = 0.0
+        for lr_imgs, hr_imgs in train_loader:
+            lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
+            optimizer.zero_grad()
+            outputs = model(lr_imgs)
+            loss = criterion(outputs, hr_imgs)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        train_loss /= len(train_loader)
+
+        model.eval()
+        val_loss = 0.0
+        val_ssim = 0.0
+        val_mae = 0.0
+        num_samples = 0
+
+        with torch.no_grad():
+            for lr_imgs, hr_imgs in val_loader:
+                lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
+                outputs = model(lr_imgs)
+
+                val_loss += criterion(outputs, hr_imgs).item()
+                val_mae += F.l1_loss(outputs, hr_imgs).item()
+
+                for i in range(outputs.size(0)):
+                    val_ssim += compute_ssim(outputs[i], hr_imgs[i])
+                    num_samples += 1
+
+        val_loss /= len(val_loader)
+        val_mae /= len(val_loader)
+        val_ssim /= num_samples if num_samples > 0 else 1
+
+        print(
+            f"Epoch {epoch}/{epochs} - "
+            f"Train Loss: {train_loss:.6f} - "
+            f"Val Loss: {val_loss:.6f} - "
+            f"Val MAE: {val_mae:.6f} - "
+            f"Val SSIM: {val_ssim:.6f}"
+        )
+
+        wandb.log(
+            {
+                "epoch": epoch,
+                "train/loss": train_loss,
+                "val/loss": val_loss,
+                "val/mae": val_mae,
+                "val/ssim": val_ssim,
+            }
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), save_path)
+            print(f"Saved best model (val_loss: {best_val_loss:.6f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train SRCNN for super-resolution")
+    parser.add_argument("--data-dir", type=Path, default="apod_data/dataset", help="Dataset root directory")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
+    parser.add_argument("--save-path", type=Path, default="checkpoints/srcnn_best.pth", help="Path to save best model")
+    parser.add_argument("--preview-dir", type=Path, default="previews/scnn", help="Directory to save preview images")
+    parser.add_argument("--num-previews", type=int, default=5, help="Number of preview samples to save")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    wandb.init(
+        project="ORIon-SR",
+        name="SR CNN",
+        config={
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "patience": args.patience,
+            "device": str(device),
+        },
+    )
+
+    train_dataset = SRDataset(args.data_dir, split="train")
+    val_dataset = SRDataset(args.data_dir, split="val")
+    test_dataset = SRDataset(args.data_dir, split="test")
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    model = SRCNN().to(device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    args.save_path.parent.mkdir(parents=True, exist_ok=True)
+    args.preview_dir.mkdir(parents=True, exist_ok=True)
+
+    train(model, train_loader, val_loader, device, args.epochs, args.lr, args.patience, args.save_path)
+
+    print(f"\nLoading best model from {args.save_path}")
+    model.load_state_dict(torch.load(args.save_path, map_location=device, weights_only=True))
+    generate_previews(model, test_loader, device, args.preview_dir, args.num_previews)
+
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
