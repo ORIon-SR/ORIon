@@ -297,7 +297,7 @@ def main() -> None:
         test_dataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=4, pin_memory=True
     )
 
-    model = SRCNN(upscale_factor=args.scaling-factor).to(device)
+    model = SRCNN(upscale_factor=args.scaling_factor).to(device)
     model = DDP(model, device_ids=[device.index])
 
     if is_main:
