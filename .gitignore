@@ -220,3 +220,8 @@ __marimo__/
 apod_data/images
 apod_data/images.7z
 apod_data/dataset
+wandb/
+apod_data/*.tar.gz
+
+*.pth
+.python-version
