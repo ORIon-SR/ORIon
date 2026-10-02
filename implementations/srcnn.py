@@ -1,14 +1,18 @@
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
 from PIL import Image
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
+import wandb
 from dataloader import SRDataset
 
 
@@ -85,7 +89,9 @@ def compute_ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) 
     return ssim_map.mean().item()
 
 
-def save_preview(lr_img: torch.Tensor, sr_img: torch.Tensor, hr_img: torch.Tensor, save_path: Path, idx: int) -> None:
+def save_preview(
+    lr_img: torch.Tensor, sr_img: torch.Tensor, hr_img: torch.Tensor, save_path: Path, idx: int, epoch: int
+) -> None:
     def to_pil(tensor: torch.Tensor) -> Image.Image:
         arr = tensor.clamp(0, 1).mul(255).byte().cpu().numpy()
         arr = np.transpose(arr, (1, 2, 0))
@@ -103,8 +109,8 @@ def save_preview(lr_img: torch.Tensor, sr_img: torch.Tensor, hr_img: torch.Tenso
     combined.paste(sr_pil, (width, 0))
     combined.paste(hr_pil, (width * 2, 0))
 
-    combined.save(save_path / f"preview_{idx:03d}.png")
-    wandb.log({f"preview/{idx}": wandb.Image(combined, caption=f"LR | SR | HR - sample {idx}")})
+    combined.save(save_path / f"preview_{idx:03d}_epoch{epoch:03d}.png")
+    wandb.log({f"preview/{idx}": wandb.Image(combined, caption=f"LR | SR | HR - sample {idx} (epoch {epoch})")})
 
 
 def generate_previews(
@@ -113,6 +119,7 @@ def generate_previews(
     device: torch.device,
     preview_dir: Path,
     num_previews: int,
+    epoch: int,
 ) -> None:
     model.eval()
     preview_count = 0
@@ -125,24 +132,28 @@ def generate_previews(
             for i in range(outputs.size(0)):
                 if preview_count >= num_previews:
                     break
-                save_preview(lr_imgs[i], outputs[i], hr_imgs[i], preview_dir, preview_count)
+                save_preview(lr_imgs[i], outputs[i], hr_imgs[i], preview_dir, preview_count, epoch)
                 preview_count += 1
 
             if preview_count >= num_previews:
                 break
 
-    print(f"Generated {preview_count} preview images in {preview_dir}")
+    print(f"Generated {preview_count} preview images for epoch {epoch} in {preview_dir}")
 
 
 def train(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
+    test_loader: DataLoader,
     device: torch.device,
     epochs: int,
     lr: float,
     patience: int,
     save_path: Path,
+    preview_dir: Path,
+    num_previews: int,
+    rank: int,
 ) -> None:
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -186,34 +197,52 @@ def train(
         val_mae /= len(val_loader)
         val_ssim /= num_samples if num_samples > 0 else 1
 
-        print(
-            f"Epoch {epoch}/{epochs} - "
-            f"Train Loss: {train_loss:.6f} - "
-            f"Val Loss: {val_loss:.6f} - "
-            f"Val MAE: {val_mae:.6f} - "
-            f"Val SSIM: {val_ssim:.6f}"
-        )
-
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/loss": train_loss,
-                "val/loss": val_loss,
-                "val/mae": val_mae,
-                "val/ssim": val_ssim,
-            }
-        )
-
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), save_path)
-            print(f"Saved best model (val_loss: {best_val_loss:.6f})")
+            if rank == 0:
+                torch.save(model.module.state_dict(), save_path)
+                print(f"Saved best model (val_loss: {best_val_loss:.6f})")
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
+
+        if rank == 0:
+            print(
+                f"Epoch {epoch}/{epochs} - "
+                f"Train Loss: {train_loss:.6f} - "
+                f"Val Loss: {val_loss:.6f} - "
+                f"Val MAE: {val_mae:.6f} - "
+                f"Val SSIM: {val_ssim:.6f} - "
+                f"Epochs w/o improvement: {patience_counter}"
+            )
+
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train/loss": train_loss,
+                    "val/loss": val_loss,
+                    "val/mae": val_mae,
+                    "val/ssim": val_ssim,
+                    "epochs_without_improvement": patience_counter,
+                }
+            )
+
+            raw_model = model.module if isinstance(model, DDP) else model
+            generate_previews(raw_model, test_loader, device, preview_dir, num_previews, epoch)
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+
+def setup_ddp() -> tuple[int, int, torch.device]:
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    return rank, world_size, device
 
 
 def main() -> None:
@@ -221,49 +250,81 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default="apod_data/dataset", help="Dataset root directory")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU")
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
     parser.add_argument("--save-path", type=Path, default="checkpoints/srcnn_best.pth", help="Path to save best model")
     parser.add_argument("--preview-dir", type=Path, default="previews/scnn", help="Directory to save preview images")
     parser.add_argument("--num-previews", type=int, default=5, help="Number of preview samples to save")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    rank, world_size, device = setup_ddp()
+    is_main = rank == 0
 
-    wandb.init(
-        project="ORIon-SR",
-        name="SR CNN",
-        config={
-            "epochs": args.epochs,
-            "lr": args.lr,
-            "batch_size": args.batch_size,
-            "patience": args.patience,
-            "device": str(device),
-        },
-    )
+    if is_main:
+        print(f"Using {world_size} GPUs")
+        wandb.init(
+            project="ORIon-SR",
+            name="SR CNN",
+            config={
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "patience": args.patience,
+                "device": str(device),
+                "world_size": world_size,
+            },
+        )
 
     train_dataset = SRDataset(args.data_dir, split="train")
     val_dataset = SRDataset(args.data_dir, split="val")
     test_dataset = SRDataset(args.data_dir, split="test")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=4, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=4, pin_memory=True
+    )
 
     model = SRCNN().to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    model = DDP(model, device_ids=[device.index])
 
-    args.save_path.parent.mkdir(parents=True, exist_ok=True)
-    args.preview_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+        args.save_path.parent.mkdir(parents=True, exist_ok=True)
+        args.preview_dir.mkdir(parents=True, exist_ok=True)
 
-    train(model, train_loader, val_loader, device, args.epochs, args.lr, args.patience, args.save_path)
+    train(
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        device,
+        args.epochs,
+        args.lr,
+        args.patience,
+        args.save_path,
+        args.preview_dir,
+        args.num_previews,
+        rank,
+    )
 
-    print(f"\nLoading best model from {args.save_path}")
-    model.load_state_dict(torch.load(args.save_path, map_location=device, weights_only=True))
-    generate_previews(model, test_loader, device, args.preview_dir, args.num_previews)
+    if is_main:
+        print(f"\nLoading best model from {args.save_path}")
+        raw_model = SRCNN()
+        raw_model.load_state_dict(torch.load(args.save_path, map_location=device, weights_only=True))
+        raw_model = raw_model.to(device)
+        generate_previews(raw_model, test_loader, device, args.preview_dir, args.num_previews, epoch=0)
+        wandb.finish()
 
-    wandb.finish()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
