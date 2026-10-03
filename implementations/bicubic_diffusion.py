@@ -133,13 +133,13 @@ class ConditionalUNet(nn.Module):
         return self.out_conv(u1)
 
 
-def train_one_epoch(model, scheduler, dataloader, optimizer, device):
+def train_one_epoch(model, scheduler, dataloader, optimizer, scaler, device, amp_dtype):
     model.train()
     total_loss = 0.0
 
     for lr_imgs, hr_imgs in dataloader:
-        lr_imgs = lr_imgs.to(device)
-        hr_imgs = hr_imgs.to(device)
+        lr_imgs = lr_imgs.to(device, non_blocking=True)
+        hr_imgs = hr_imgs.to(device, non_blocking=True)
 
         hr_imgs = hr_imgs * 2.0 - 1.0
         lr_imgs = lr_imgs * 2.0 - 1.0
@@ -158,14 +158,17 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, device):
         x_t = scheduler.add_noise(hr_imgs, noise, t)
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
-        pred_noise = model(model_input, t)
 
-        loss = F.mse_loss(pred_noise, noise)
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            pred_noise = model(model_input, t)
+            loss = F.mse_loss(pred_noise, noise)
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
 
@@ -173,7 +176,7 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, device):
 
 
 @torch.no_grad()
-def validate(model, scheduler, dataloader, device):
+def validate(model, scheduler, dataloader, device, amp_dtype):
     model.eval()
     total_loss = 0.0
     total_ssim = 0.0
@@ -181,8 +184,8 @@ def validate(model, scheduler, dataloader, device):
     num_samples = 0
 
     for lr_imgs, hr_imgs in dataloader:
-        lr_imgs = lr_imgs.to(device)
-        hr_imgs = hr_imgs.to(device)
+        lr_imgs = lr_imgs.to(device, non_blocking=True)
+        hr_imgs = hr_imgs.to(device, non_blocking=True)
 
         hr_imgs_scaled = hr_imgs * 2.0 - 1.0
         lr_imgs_scaled = lr_imgs * 2.0 - 1.0
@@ -201,11 +204,14 @@ def validate(model, scheduler, dataloader, device):
         x_t = scheduler.add_noise(hr_imgs_scaled, noise, t)
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
-        pred_noise = model(model_input, t)
 
-        loss = F.mse_loss(pred_noise, noise)
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            pred_noise = model(model_input, t)
+            loss = F.mse_loss(pred_noise, noise)
+
         total_loss += loss.item()
 
+        pred_noise = pred_noise.float()
         sqrt_alpha_cumprod = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
         sqrt_one_minus_alpha_cumprod = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(
             -1, 1, 1, 1
@@ -232,7 +238,11 @@ def validate(model, scheduler, dataloader, device):
 
 @torch.no_grad()
 def sample_super_resolution(
-    model, scheduler, lr_img: torch.Tensor, target_size: tuple[int, int]
+    model,
+    scheduler,
+    lr_img: torch.Tensor,
+    target_size: tuple[int, int],
+    amp_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     model.eval()
     device = lr_img.device
@@ -247,7 +257,10 @@ def sample_super_resolution(
         t = torch.full((1,), t_idx, device=device, dtype=torch.long)
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
-        pred_noise = model(model_input, t)
+
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            pred_noise = model(model_input, t)
+        pred_noise = pred_noise.float()
 
         beta = scheduler.betas[t_idx]
         alpha = scheduler.alphas[t_idx]
@@ -315,14 +328,15 @@ def generate_previews(
     preview_dir: Path,
     num_previews: int,
     epoch: int,
+    amp_dtype: torch.dtype | None = None,
 ) -> None:
     model.eval()
     preview_count = 0
 
     with torch.no_grad():
         for lr_imgs, hr_imgs in test_loader:
-            lr_imgs = lr_imgs.to(device)
-            hr_imgs = hr_imgs.to(device)
+            lr_imgs = lr_imgs.to(device, non_blocking=True)
+            hr_imgs = hr_imgs.to(device, non_blocking=True)
 
             hr_size = hr_imgs.shape[-2:]
 
@@ -331,7 +345,7 @@ def generate_previews(
                     break
 
                 sr_img = sample_super_resolution(
-                    model, scheduler, lr_imgs[i : i + 1], hr_size
+                    model, scheduler, lr_imgs[i : i + 1], hr_size, amp_dtype
                 )
                 save_preview(
                     lr_imgs[i], sr_img[0], hr_imgs[i], preview_dir, preview_count, epoch
@@ -372,16 +386,22 @@ def train(
     num_previews: int,
     rank: int,
     train_sampler,
+    amp_dtype: torch.dtype | None,
 ) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
 
     best_val_loss = float("inf")
     patience_counter = 0
 
     for epoch in range(1, epochs + 1):
         train_sampler.set_epoch(epoch)
-        train_loss = train_one_epoch(model, scheduler, train_loader, optimizer, device)
-        val_loss, val_ssim, val_mae = validate(model, scheduler, val_loader, device)
+        train_loss = train_one_epoch(
+            model, scheduler, train_loader, optimizer, scaler, device, amp_dtype
+        )
+        val_loss, val_ssim, val_mae = validate(
+            model, scheduler, val_loader, device, amp_dtype
+        )
 
         if rank == 0:
             if val_loss < best_val_loss:
@@ -414,7 +434,14 @@ def train(
             )
 
             generate_previews(
-                model, scheduler, test_loader, device, preview_dir, num_previews, epoch
+                model,
+                scheduler,
+                test_loader,
+                device,
+                preview_dir,
+                num_previews,
+                epoch,
+                amp_dtype,
             )
 
         dist.barrier()
@@ -461,6 +488,18 @@ def main() -> None:
     parser.add_argument(
         "--num-timesteps", type=int, default=1000, help="Number of diffusion timesteps"
     )
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mixed precision (bf16 if supported, else fp16)",
+    )
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile the model with torch.compile()",
+    )
     args = parser.parse_args()
 
     local_rank = setup_ddp()
@@ -468,8 +507,13 @@ def main() -> None:
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{local_rank}")
 
+    amp_dtype = None
+    if args.amp:
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
     if rank == 0:
         print(f"Using device: {device}, World size: {world_size}")
+        print(f"AMP: {args.amp} (dtype: {amp_dtype}), torch.compile: {args.compile}")
         wandb.init(
             project="ORIon-SR",
             name="Bicubic Diffusion DDP",
@@ -481,6 +525,9 @@ def main() -> None:
                 "num_timesteps": args.num_timesteps,
                 "world_size": world_size,
                 "device": str(device),
+                "amp": args.amp,
+                "amp_dtype": str(amp_dtype),
+                "compile": args.compile,
             },
         )
 
@@ -524,6 +571,11 @@ def main() -> None:
     model = ConditionalUNet().to(device)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
+    if args.compile:
+        if rank == 0:
+            print("Compiling model with torch.compile()...")
+        model = torch.compile(model)
+
     if rank == 0:
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         args.save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -544,6 +596,7 @@ def main() -> None:
         args.num_previews,
         rank,
         train_sampler,
+        amp_dtype,
     )
 
     if rank == 0:
@@ -559,6 +612,7 @@ def main() -> None:
             args.preview_dir,
             args.num_previews,
             epoch=0,
+            amp_dtype=amp_dtype,
         )
         wandb.finish()
 
