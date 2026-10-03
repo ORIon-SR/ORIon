@@ -1,14 +1,17 @@
 import argparse
 import math
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from PIL import Image
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 
 from dataloader import SRDataset
 from metrics import compute_ssim
@@ -343,6 +346,17 @@ def generate_previews(
     )
 
 
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+def cleanup_ddp():
+    dist.destroy_process_group()
+
+
 def train(
     model,
     scheduler,
@@ -356,6 +370,8 @@ def train(
     save_path: Path,
     preview_dir: Path,
     num_previews: int,
+    rank: int,
+    train_sampler,
 ) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -363,44 +379,49 @@ def train(
     patience_counter = 0
 
     for epoch in range(1, epochs + 1):
+        train_sampler.set_epoch(epoch)
         train_loss = train_one_epoch(model, scheduler, train_loader, optimizer, device)
         val_loss, val_ssim, val_mae = validate(model, scheduler, val_loader, device)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), save_path)
-            print(f"Saved best model (val_loss: {best_val_loss:.6f})")
-        else:
-            patience_counter += 1
+        if rank == 0:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save(model.module.state_dict(), save_path)
+                print(f"Saved best model (val_loss: {best_val_loss:.6f})")
+            else:
+                patience_counter += 1
 
-        print(
-            f"Epoch {epoch}/{epochs} - "
-            f"Train Loss: {train_loss:.6f} - "
-            f"Val Loss: {val_loss:.6f} - "
-            f"Val MAE: {val_mae:.6f} - "
-            f"Val SSIM: {val_ssim:.6f} - "
-            f"Epochs w/o improvement: {patience_counter}"
-        )
+            print(
+                f"Epoch {epoch}/{epochs} - "
+                f"Train Loss: {train_loss:.6f} - "
+                f"Val Loss: {val_loss:.6f} - "
+                f"Val MAE: {val_mae:.6f} - "
+                f"Val SSIM: {val_ssim:.6f} - "
+                f"Epochs w/o improvement: {patience_counter}"
+            )
 
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/loss": train_loss,
-                "val/loss": val_loss,
-                "val/mae": val_mae,
-                "val/ssim": val_ssim,
-                "epochs_without_improvement": patience_counter,
-            },
-            step=epoch,
-        )
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train/loss": train_loss,
+                    "val/loss": val_loss,
+                    "val/mae": val_mae,
+                    "val/ssim": val_ssim,
+                    "epochs_without_improvement": patience_counter,
+                },
+                step=epoch,
+            )
 
-        generate_previews(
-            model, scheduler, test_loader, device, preview_dir, num_previews, epoch
-        )
+            generate_previews(
+                model, scheduler, test_loader, device, preview_dir, num_previews, epoch
+            )
+
+        dist.barrier()
 
         if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch}")
+            if rank == 0:
+                print(f"Early stopping at epoch {epoch}")
             break
 
 
@@ -442,54 +463,71 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    local_rank = setup_ddp()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{local_rank}")
 
-    wandb.init(
-        project="ORIon-SR",
-        name="Bicubic Diffusion",
-        config={
-            "epochs": args.epochs,
-            "lr": args.lr,
-            "batch_size": args.batch_size,
-            "patience": args.patience,
-            "num_timesteps": args.num_timesteps,
-            "device": str(device),
-        },
-    )
+    if rank == 0:
+        print(f"Using device: {device}, World size: {world_size}")
+        wandb.init(
+            project="ORIon-SR",
+            name="Bicubic Diffusion DDP",
+            config={
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "patience": args.patience,
+                "num_timesteps": args.num_timesteps,
+                "world_size": world_size,
+                "device": str(device),
+            },
+        )
 
     train_dataset = SRDataset(args.data_dir, split="train")
     val_dataset = SRDataset(args.data_dir, split="val")
     test_dataset = SRDataset(args.data_dir, split="test")
 
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    val_sampler = DistributedSampler(
+        val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+    )
+    test_sampler = DistributedSampler(
+        test_dataset, num_replicas=world_size, rank=rank, shuffle=False
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=4,
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        sampler=val_sampler,
         num_workers=4,
         pin_memory=True,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        sampler=test_sampler,
         num_workers=4,
         pin_memory=True,
     )
 
     scheduler = DDPMScheduler(num_timesteps=args.num_timesteps, device=str(device))
     model = ConditionalUNet().to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    args.save_path.parent.mkdir(parents=True, exist_ok=True)
-    args.preview_dir.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+        args.save_path.parent.mkdir(parents=True, exist_ok=True)
+        args.preview_dir.mkdir(parents=True, exist_ok=True)
 
     train(
         model,
@@ -504,23 +542,27 @@ def main() -> None:
         args.save_path,
         args.preview_dir,
         args.num_previews,
+        rank,
+        train_sampler,
     )
 
-    print(f"\nLoading best model from {args.save_path}")
-    model.load_state_dict(
-        torch.load(args.save_path, map_location=device, weights_only=True)
-    )
-    generate_previews(
-        model,
-        scheduler,
-        test_loader,
-        device,
-        args.preview_dir,
-        args.num_previews,
-        epoch=0,
-    )
+    if rank == 0:
+        print(f"\nLoading best model from {args.save_path}")
+        model.module.load_state_dict(
+            torch.load(args.save_path, map_location=device, weights_only=True)
+        )
+        generate_previews(
+            model,
+            scheduler,
+            test_loader,
+            device,
+            args.preview_dir,
+            args.num_previews,
+            epoch=0,
+        )
+        wandb.finish()
 
-    wandb.finish()
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
