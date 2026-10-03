@@ -10,6 +10,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from dataloader import SRDataset
+from metrics import compute_ssim
 
 
 class ResBlock(nn.Module):
@@ -59,33 +60,9 @@ class SRCNN(nn.Module):
         return self.final(x)
 
 
-def compute_ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> float:
-    C1 = 0.01**2
-    C2 = 0.03**2
-
-    img1 = img1.unsqueeze(0)
-    img2 = img2.unsqueeze(0)
-
-    channels = img1.size(1)
-    window = torch.ones(channels, 1, window_size, window_size, device=img1.device)
-    window = window / (window_size**2)
-
-    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channels)
-    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channels)
-
-    mu1_sq = mu1**2
-    mu2_sq = mu2**2
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = F.conv2d(img1**2, window, padding=window_size // 2, groups=channels) - mu1_sq
-    sigma2_sq = F.conv2d(img2**2, window, padding=window_size // 2, groups=channels) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channels) - mu1_mu2
-
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-    return ssim_map.mean().item()
-
-
-def save_preview(lr_img: torch.Tensor, sr_img: torch.Tensor, hr_img: torch.Tensor, save_path: Path, idx: int) -> None:
+def save_preview(
+    lr_img: torch.Tensor, sr_img: torch.Tensor, hr_img: torch.Tensor, save_path: Path, idx: int, epoch: int
+) -> None:
     def to_pil(tensor: torch.Tensor) -> Image.Image:
         arr = tensor.clamp(0, 1).mul(255).byte().cpu().numpy()
         arr = np.transpose(arr, (1, 2, 0))
@@ -103,8 +80,8 @@ def save_preview(lr_img: torch.Tensor, sr_img: torch.Tensor, hr_img: torch.Tenso
     combined.paste(sr_pil, (width, 0))
     combined.paste(hr_pil, (width * 2, 0))
 
-    combined.save(save_path / f"preview_{idx:03d}.png")
-    wandb.log({f"preview/{idx}": wandb.Image(combined, caption=f"LR | SR | HR - sample {idx}")})
+    combined.save(save_path / f"preview_{idx:03d}_epoch{epoch:03d}.png")
+    wandb.log({f"preview/{idx}": wandb.Image(combined, caption=f"LR | SR | HR - sample {idx} (epoch {epoch})")}, step=epoch)
 
 
 def generate_previews(
@@ -113,6 +90,7 @@ def generate_previews(
     device: torch.device,
     preview_dir: Path,
     num_previews: int,
+    epoch: int,
 ) -> None:
     model.eval()
     preview_count = 0
@@ -125,24 +103,27 @@ def generate_previews(
             for i in range(outputs.size(0)):
                 if preview_count >= num_previews:
                     break
-                save_preview(lr_imgs[i], outputs[i], hr_imgs[i], preview_dir, preview_count)
+                save_preview(lr_imgs[i], outputs[i], hr_imgs[i], preview_dir, preview_count, epoch)
                 preview_count += 1
 
             if preview_count >= num_previews:
                 break
 
-    print(f"Generated {preview_count} preview images in {preview_dir}")
+    print(f"Generated {preview_count} preview images for epoch {epoch} in {preview_dir}")
 
 
 def train(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
+    test_loader: DataLoader,
     device: torch.device,
     epochs: int,
     lr: float,
     patience: int,
     save_path: Path,
+    preview_dir: Path,
+    num_previews: int,
 ) -> None:
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -201,8 +182,12 @@ def train(
                 "val/loss": val_loss,
                 "val/mae": val_mae,
                 "val/ssim": val_ssim,
-            }
+                "epochs_without_improvement": patience_counter,
+            },
+            step=epoch,
         )
+
+        generate_previews(model, test_loader, device, preview_dir, num_previews, epoch)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -226,6 +211,7 @@ def main() -> None:
     parser.add_argument("--save-path", type=Path, default="checkpoints/srcnn_best.pth", help="Path to save best model")
     parser.add_argument("--preview-dir", type=Path, default="previews/scnn", help="Directory to save preview images")
     parser.add_argument("--num-previews", type=int, default=5, help="Number of preview samples to save")
+    parser.add_argument("--scaling-factor", type=int, default=16, help="Factor by which to upscale LR images")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -251,17 +237,31 @@ def main() -> None:
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = SRCNN().to(device)
+    model = SRCNN(upscale_factor=args.scaling_factor).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
     args.preview_dir.mkdir(parents=True, exist_ok=True)
 
-    train(model, train_loader, val_loader, device, args.epochs, args.lr, args.patience, args.save_path)
+    train(
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        device,
+        args.epochs,
+        args.lr,
+        args.patience,
+        args.save_path,
+        args.preview_dir,
+        args.num_previews,
+    )
 
     print(f"\nLoading best model from {args.save_path}")
-    model.load_state_dict(torch.load(args.save_path, map_location=device, weights_only=True))
-    generate_previews(model, test_loader, device, args.preview_dir, args.num_previews)
+    raw_model = SRCNN()
+    raw_model.load_state_dict(torch.load(args.save_path, map_location=device, weights_only=True))
+    raw_model = raw_model.to(device)
+    generate_previews(raw_model, test_loader, device, args.preview_dir, args.num_previews, epoch=0)
 
     wandb.finish()
 
