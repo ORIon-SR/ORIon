@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=x16_diffusion
 #SBATCH --partition=prime
-#SBATCH --nodelist=griffin
+#SBATCH --nodelist=phoenix
 #SBATCH --output=/home-mscluster/%u/ORIon/implementations/results/diffusion-output-%N-%j.txt
 #SBATCH --error=/home-mscluster/%u/ORIon/implementations/results/diffusion-error-%N-%j.txt
 
