@@ -106,10 +106,10 @@ class ConditionalUNet(nn.Module):
         self.mid = ResBlock(256, 256, time_dim)
 
         self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
-        self.up_block2 = ResBlock(256, 128, time_dim)
+        self.up_block2 = ResBlock(384, 128, time_dim)
 
         self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
-        self.up_block1 = ResBlock(128, 64, time_dim)
+        self.up_block1 = ResBlock(192, 64, time_dim)
 
         self.out_conv = nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
 
