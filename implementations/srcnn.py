@@ -162,14 +162,14 @@ def train(
                 outputs = model(lr_imgs)
 
                 val_loss += criterion(outputs, hr_imgs).item()
-                val_mae += F.l1_loss(outputs, hr_imgs).item()
 
                 for i in range(outputs.size(0)):
                     val_ssim += compute_ssim(outputs[i], hr_imgs[i])
+                    val_mae += F.l1_loss(outputs[i], hr_imgs[i]).item()
                     num_samples += 1
 
         val_loss /= len(val_loader)
-        val_mae /= len(val_loader)
+        val_mae /= num_samples if num_samples > 0 else 1
         val_ssim /= num_samples if num_samples > 0 else 1
 
         if val_loss < best_val_loss:
