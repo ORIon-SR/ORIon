@@ -173,26 +173,29 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, device):
 def validate(model, scheduler, dataloader, device):
     model.eval()
     total_loss = 0.0
+    total_ssim = 0.0
+    total_mae = 0.0
+    num_samples = 0
 
     for lr_imgs, hr_imgs in dataloader:
         lr_imgs = lr_imgs.to(device)
         hr_imgs = hr_imgs.to(device)
 
-        hr_imgs = hr_imgs * 2.0 - 1.0
-        lr_imgs = lr_imgs * 2.0 - 1.0
+        hr_imgs_scaled = hr_imgs * 2.0 - 1.0
+        lr_imgs_scaled = lr_imgs * 2.0 - 1.0
 
         batch_size = hr_imgs.size(0)
         hr_size = hr_imgs.shape[-2:]
 
         lr_conditioned = F.interpolate(
-            lr_imgs, size=hr_size, mode="bicubic", align_corners=False
+            lr_imgs_scaled, size=hr_size, mode="bicubic", align_corners=False
         )
 
         t = torch.randint(
             0, scheduler.num_timesteps, (batch_size,), device=device
         ).long()
-        noise = torch.randn_like(hr_imgs)
-        x_t = scheduler.add_noise(hr_imgs, noise, t)
+        noise = torch.randn_like(hr_imgs_scaled)
+        x_t = scheduler.add_noise(hr_imgs_scaled, noise, t)
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
         pred_noise = model(model_input, t)
@@ -200,7 +203,28 @@ def validate(model, scheduler, dataloader, device):
         loss = F.mse_loss(pred_noise, noise)
         total_loss += loss.item()
 
-    return total_loss / len(dataloader)
+        sqrt_alpha_cumprod = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_cumprod = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(
+            -1, 1, 1, 1
+        )
+
+        pred_x0 = (
+            x_t - sqrt_one_minus_alpha_cumprod * pred_noise
+        ) / sqrt_alpha_cumprod
+
+        pred_x0_img = (pred_x0 + 1.0) / 2.0
+        pred_x0_img = pred_x0_img.clamp(0, 1)
+
+        for i in range(batch_size):
+            total_ssim += compute_ssim(pred_x0_img[i], hr_imgs[i])
+            total_mae += F.l1_loss(pred_x0_img[i], hr_imgs[i]).item()
+            num_samples += 1
+
+    avg_loss = total_loss / len(dataloader)
+    avg_ssim = total_ssim / num_samples if num_samples > 0 else 0.0
+    avg_mae = total_mae / num_samples if num_samples > 0 else 0.0
+
+    return avg_loss, avg_ssim, avg_mae
 
 
 @torch.no_grad()
@@ -340,7 +364,7 @@ def train(
 
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(model, scheduler, train_loader, optimizer, device)
-        val_loss = validate(model, scheduler, val_loader, device)
+        val_loss, val_ssim, val_mae = validate(model, scheduler, val_loader, device)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -354,6 +378,8 @@ def train(
             f"Epoch {epoch}/{epochs} - "
             f"Train Loss: {train_loss:.6f} - "
             f"Val Loss: {val_loss:.6f} - "
+            f"Val MAE: {val_mae:.6f} - "
+            f"Val SSIM: {val_ssim:.6f} - "
             f"Epochs w/o improvement: {patience_counter}"
         )
 
@@ -362,6 +388,8 @@ def train(
                 "epoch": epoch,
                 "train/loss": train_loss,
                 "val/loss": val_loss,
+                "val/mae": val_mae,
+                "val/ssim": val_ssim,
                 "epochs_without_improvement": patience_counter,
             },
             step=epoch,
