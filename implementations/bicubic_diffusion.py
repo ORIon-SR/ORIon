@@ -137,7 +137,7 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, scaler, device, amp
     model.train()
     total_loss = 0.0
 
-    for lr_imgs, hr_imgs in dataloader:
+    for batch_idx, (lr_imgs, hr_imgs) in enumerate(dataloader):
         lr_imgs = lr_imgs.to(device, non_blocking=True)
         hr_imgs = hr_imgs.to(device, non_blocking=True)
 
@@ -171,6 +171,9 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, scaler, device, amp
         scaler.update()
 
         total_loss += loss.item()
+
+        if (batch_idx + 1) % 20 == 0:
+            print(f"  Batch {batch_idx + 1}/{len(dataloader)} - Loss: {loss.item():.6f}")
 
     return total_loss / len(dataloader)
 
@@ -317,6 +320,7 @@ def save_preview(
             )
         },
         step=epoch,
+        commit=False,
     )
 
 
