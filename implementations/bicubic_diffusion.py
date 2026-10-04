@@ -161,7 +161,16 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, scaler, device, amp
 
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred_noise = model(model_input, t)
-            loss = F.huber_loss(pred_noise, noise)
+
+        sqrt_alpha_cumprod = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_cumprod = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(
+            -1, 1, 1, 1
+        )
+        pred_x0 = (
+            x_t - sqrt_one_minus_alpha_cumprod * pred_noise
+        ) / sqrt_alpha_cumprod
+
+        loss = F.mse_loss(pred_x0, hr_imgs)
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -210,19 +219,18 @@ def validate(model, scheduler, dataloader, device, amp_dtype):
 
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred_noise = model(model_input, t)
-            loss = F.huber_loss(pred_noise, noise)
-
-        total_loss += loss.item()
 
         pred_noise = pred_noise.float()
         sqrt_alpha_cumprod = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
         sqrt_one_minus_alpha_cumprod = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(
             -1, 1, 1, 1
         )
-
         pred_x0 = (
             x_t - sqrt_one_minus_alpha_cumprod * pred_noise
         ) / sqrt_alpha_cumprod
+
+        loss = F.mse_loss(pred_x0, hr_imgs_scaled)
+        total_loss += loss.item()
 
         pred_x0_img = (pred_x0 + 1.0) / 2.0
         pred_x0_img = pred_x0_img.clamp(0, 1)
@@ -398,7 +406,7 @@ def train(
     )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
 
-    best_val_loss = float("inf")
+    best_val_ssim = 0.0
     patience_counter = 0
 
     for epoch in range(1, epochs + 1):
@@ -413,11 +421,11 @@ def train(
 
         if rank == 0:
             current_lr = lr_scheduler.get_last_lr()[0]
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_ssim > best_val_ssim:
+                best_val_ssim = val_ssim
                 patience_counter = 0
                 torch.save(model.module.state_dict(), save_path)
-                print(f"Saved best model (val_loss: {best_val_loss:.6f})")
+                print(f"Saved best model (val_ssim: {best_val_ssim:.6f})")
             else:
                 patience_counter += 1
 
