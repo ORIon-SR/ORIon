@@ -15,4 +15,4 @@ echo "Activating venv"
 source /home-mscluster/$USER/ORIon/.venv/bin/activate
 
 echo "Running torchrun"
-torchrun --nproc-per-node=2 bicubic_diffusion.py --batch-size 8
+torchrun --nproc-per-node=2 bicubic_diffusion.py --batch-size 8 --epochs 200 --patience 30
