@@ -161,7 +161,7 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, scaler, device, amp
 
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred_noise = model(model_input, t)
-            loss = F.mse_loss(pred_noise, noise)
+            loss = F.huber_loss(pred_noise, noise)
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -210,7 +210,7 @@ def validate(model, scheduler, dataloader, device, amp_dtype):
 
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred_noise = model(model_input, t)
-            loss = F.mse_loss(pred_noise, noise)
+            loss = F.huber_loss(pred_noise, noise)
 
         total_loss += loss.item()
 
@@ -296,9 +296,9 @@ def save_preview(
         arr = np.transpose(arr, (1, 2, 0))
         return Image.fromarray(arr)
 
-    lr_img = (lr_img + 1.0) / 2.0
+    lr_img = lr_img.clamp(0, 1)
     sr_img = (sr_img + 1.0) / 2.0
-    hr_img = (hr_img + 1.0) / 2.0
+    hr_img = hr_img.clamp(0, 1)
 
     lr_pil = to_pil(lr_img)
     sr_pil = to_pil(sr_img)
@@ -393,6 +393,9 @@ def train(
     amp_dtype: torch.dtype | None,
 ) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=lr * 0.01
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
 
     best_val_loss = float("inf")
@@ -406,8 +409,10 @@ def train(
         val_loss, val_ssim, val_mae = validate(
             model, scheduler, val_loader, device, amp_dtype
         )
+        lr_scheduler.step()
 
         if rank == 0:
+            current_lr = lr_scheduler.get_last_lr()[0]
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
@@ -422,6 +427,7 @@ def train(
                 f"Val Loss: {val_loss:.6f} - "
                 f"Val MAE: {val_mae:.6f} - "
                 f"Val SSIM: {val_ssim:.6f} - "
+                f"LR: {current_lr:.2e} - "
                 f"Epochs w/o improvement: {patience_counter}"
             )
 
@@ -432,6 +438,7 @@ def train(
                     "val/loss": val_loss,
                     "val/mae": val_mae,
                     "val/ssim": val_ssim,
+                    "train/lr": current_lr,
                     "epochs_without_improvement": patience_counter,
                 },
                 step=epoch,
