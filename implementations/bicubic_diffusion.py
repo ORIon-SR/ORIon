@@ -8,7 +8,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
 import wandb
 from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -52,76 +51,6 @@ class DDPMScheduler:
         return sqrt_alpha * x_start + sqrt_one_minus_alpha * noise
 
 
-class PerceptualLoss(nn.Module):
-    def __init__(self, device: str = "cuda"):
-        super().__init__()
-        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
-        self.slices = nn.ModuleDict({
-            "slice1": vgg[:4],
-            "slice2": vgg[4:9],
-            "slice3": vgg[9:18],
-            "slice4": vgg[18:27],
-        })
-        for param in self.parameters():
-            param.requires_grad = False
-        self.eval()
-        self.to(device)
-
-        self.register_buffer(
-            "mean", torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-        )
-        self.register_buffer(
-            "std", torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-        )
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred = (pred * 0.5 + 0.5).clamp(0, 1)
-        target = (target * 0.5 + 0.5).clamp(0, 1)
-        pred = (pred - self.mean) / self.std
-        target = (target - self.mean) / self.std
-
-        loss = 0.0
-        x_pred, x_target = pred, target
-        for name, slice in self.slices.items():
-            x_pred = slice(x_pred)
-            x_target = slice(x_target)
-            loss += F.l1_loss(x_pred, x_target)
-        return loss / len(self.slices)
-
-
-def compute_perceptual(
-    perceptual_loss: PerceptualLoss,
-    scheduler: DDPMScheduler,
-    pred_noise: torch.Tensor,
-    x_t: torch.Tensor,
-    hr_imgs: torch.Tensor,
-    t: torch.Tensor,
-    t_max: int,
-    device: torch.device,
-    amp_dtype: torch.dtype | None,
-) -> torch.Tensor:
-    mask = t < t_max
-    if not mask.any():
-        return torch.tensor(0.0, device=device)
-
-    sqrt_alpha = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
-    sqrt_one_minus_alpha = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(-1, 1, 1, 1)
-    pred_x0 = (x_t - sqrt_one_minus_alpha * pred_noise) / sqrt_alpha
-
-    pred_sel = pred_x0[mask].float()
-    target_sel = hr_imgs[mask].float()
-    size = pred_sel.shape[-1]
-    crop = min(256, size)
-    if crop < size:
-        offset = torch.randint(0, size - crop + 1, (2,))
-        h, w = offset[0].item(), offset[1].item()
-        pred_sel = pred_sel[..., h : h + crop, w : w + crop]
-        target_sel = target_sel[..., h : h + crop, w : w + crop]
-
-    with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-        return perceptual_loss(pred_sel, target_sel)
-
-
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -156,24 +85,6 @@ class ResBlock(nn.Module):
         return h + self.shortcut(x)
 
 
-class SelfAttention(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.norm = nn.GroupNorm(32, channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        h = self.norm(x)
-        q, k, v = self.qkv(h).chunk(3, dim=1)
-        q = q.reshape(B, C, -1).permute(0, 2, 1)
-        k = k.reshape(B, C, -1)
-        v = v.reshape(B, C, -1).permute(0, 2, 1)
-        out = F.scaled_dot_product_attention(q, k, v).permute(0, 2, 1).reshape(B, C, H, W)
-        return x + self.proj(out)
-
-
 class ConditionalUNet(nn.Module):
     def __init__(
         self, in_channels: int = 6, out_channels: int = 3, time_dim: int = 256
@@ -194,9 +105,7 @@ class ConditionalUNet(nn.Module):
         self.pool2 = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)
 
         self.mid1 = ResBlock(512, 512, time_dim)
-        self.attn1 = SelfAttention(512)
         self.mid2 = ResBlock(512, 512, time_dim)
-        self.attn2 = SelfAttention(512)
 
         self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)
         self.up_block2 = ResBlock(768, 256, time_dim)
@@ -216,9 +125,7 @@ class ConditionalUNet(nn.Module):
         x5 = self.pool2(x4)
 
         mid = self.mid1(x5, t_emb)
-        mid = self.attn1(mid)
         mid = self.mid2(mid, t_emb)
-        mid = self.attn2(mid)
 
         u2 = self.up2(mid)
         u2 = self.up_block2(torch.cat([u2, x4], dim=1), t_emb)
@@ -230,13 +137,10 @@ class ConditionalUNet(nn.Module):
 
 
 def train_one_epoch(
-    model, scheduler, dataloader, optimizer, scaler, device, amp_dtype, perceptual_loss,
-    perceptual_weight=0.1, min_snr_gamma=5.0, perceptual_t_max=100
+    model, scheduler, dataloader, optimizer, scaler, device, amp_dtype, min_snr_gamma=5.0
 ):
     model.train()
     total_loss = 0.0
-    total_mse = 0.0
-    total_perc = 0.0
 
     for batch_idx, (lr_imgs, hr_imgs) in enumerate(dataloader):
         lr_imgs = lr_imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -263,18 +167,8 @@ def train_one_epoch(
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred_noise = model(model_input, t)
 
-        weights = scheduler.snr[t].clamp(max=min_snr_gamma)
-        mse_loss = (weights[:, None, None, None] * (pred_noise.float() - noise) ** 2).mean()
-
-        if perceptual_loss is not None:
-            perc_loss = compute_perceptual(
-                perceptual_loss, scheduler, pred_noise, x_t, hr_imgs, t,
-                perceptual_t_max, device, amp_dtype
-            )
-            loss = mse_loss + perceptual_weight * perc_loss
-        else:
-            perc_loss = torch.tensor(0.0, device=device)
-            loss = mse_loss
+        weights = (min_snr_gamma / scheduler.snr[t]).clamp(max=1.0)
+        loss = (weights[:, None, None, None] * (pred_noise.float() - noise) ** 2).mean()
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -284,21 +178,15 @@ def train_one_epoch(
         scaler.update()
 
         total_loss += loss.item()
-        total_mse += mse_loss.item()
-        total_perc += perc_loss.item()
 
-        if (batch_idx + 1) % 20 == 0:
+        if dist.get_rank() == 0 and (batch_idx + 1) % 20 == 0:
             print(
-                f"  Batch {batch_idx + 1}/{len(dataloader)} - "
-                f"Loss: {loss.item():.6f} (MSE: {mse_loss.item():.6f}, Perc: {perc_loss.item():.6f})"
+                f"  Batch {batch_idx + 1}/{len(dataloader)} - Loss: {loss.item():.6f}"
             )
 
-    stats = torch.tensor(
-        [total_loss, total_mse, total_perc, float(len(dataloader))], device=device
-    )
+    stats = torch.tensor([total_loss, float(len(dataloader))], device=device)
     dist.all_reduce(stats)
-    n = stats[3].item()
-    return stats[0].item() / n, stats[1].item() / n, stats[2].item() / n
+    return stats[0].item() / stats[1].item()
 
 
 @torch.no_grad()
@@ -538,10 +426,7 @@ def train(
     rank: int,
     train_sampler,
     amp_dtype: torch.dtype | None,
-    perceptual_loss,
-    perceptual_weight: float = 0.1,
     min_snr_gamma: float = 5.0,
-    perceptual_t_max: int = 100,
 ) -> int:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -557,9 +442,9 @@ def train(
     for epoch in range(1, epochs + 1):
         last_epoch = epoch
         train_sampler.set_epoch(epoch)
-        train_loss, train_mse, train_perc = train_one_epoch(
+        train_loss = train_one_epoch(
             model, scheduler, train_loader, optimizer, scaler, device, amp_dtype,
-            perceptual_loss, perceptual_weight, min_snr_gamma, perceptual_t_max
+            min_snr_gamma
         )
         val_generator.manual_seed(0)  # reset so t and noise are identical across epochs
         val_loss, val_ssim, val_mae = validate(
@@ -579,7 +464,7 @@ def train(
 
             print(
                 f"Epoch {epoch}/{epochs} - "
-                f"Train Loss: {train_loss:.6f} (MSE: {train_mse:.6f}, Perc: {train_perc:.6f}) - "
+                f"Train Loss: {train_loss:.6f} - "
                 f"Val Loss: {val_loss:.6f} - "
                 f"Val MAE: {val_mae:.6f} - "
                 f"Val SSIM: {val_ssim:.6f} - "
@@ -591,8 +476,6 @@ def train(
                 {
                     "epoch": epoch,
                     "train/loss": train_loss,
-                    "train/mse": train_mse,
-                    "train/perceptual": train_perc,
                     "val/loss": val_loss,
                     "val/mae": val_mae,
                     "val/ssim": val_ssim,
@@ -677,22 +560,10 @@ def main() -> None:
         help="Compile the model with torch.compile()",
     )
     parser.add_argument(
-        "--perceptual-weight",
-        type=float,
-        default=0.1,
-        help="Weight for perceptual loss (0 to disable)",
-    )
-    parser.add_argument(
         "--min-snr-gamma",
         type=float,
         default=5.0,
-        help="Min-SNR weighting cap for the epsilon-MSE loss",
-    )
-    parser.add_argument(
-        "--perceptual-t-max",
-        type=int,
-        default=100,
-        help="Only apply perceptual loss for timesteps below this value",
+        help="Min-SNR-γ cap; ε-MSE weight is min(1, γ/SNR). Set very large for unweighted.",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed (offset per rank)"
@@ -717,8 +588,7 @@ def main() -> None:
     if rank == 0:
         print(f"Using device: {device}, World size: {world_size}")
         print(f"AMP: {args.amp} (dtype: {amp_dtype}), torch.compile: {args.compile}")
-        print(f"Perceptual weight: {args.perceptual_weight}, TF32: enabled")
-        print(f"Min-SNR gamma: {args.min_snr_gamma}, perceptual t < {args.perceptual_t_max}")
+        print(f"Min-SNR gamma: {args.min_snr_gamma}, TF32: enabled")
         wandb.init(
             project="ORIon-SR",
             name="Bicubic Diffusion DDP",
@@ -733,9 +603,7 @@ def main() -> None:
                 "amp": args.amp,
                 "amp_dtype": str(amp_dtype),
                 "compile": args.compile,
-                "perceptual_weight": args.perceptual_weight,
                 "min_snr_gamma": args.min_snr_gamma,
-                "perceptual_t_max": args.perceptual_t_max,
                 "seed": args.seed,
             },
         )
@@ -783,12 +651,6 @@ def main() -> None:
     model = ConditionalUNet().to(memory_format=torch.channels_last).to(device)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    perceptual_loss = None
-    if args.perceptual_weight > 0:
-        perceptual_loss = PerceptualLoss(device=str(device))
-        if rank == 0:
-            print("Perceptual loss (VGG19) initialized")
-
     if args.compile:
         if rank == 0:
             print("Compiling model with torch.compile()...")
@@ -815,10 +677,7 @@ def main() -> None:
         rank,
         train_sampler,
         amp_dtype,
-        perceptual_loss,
-        args.perceptual_weight,
         args.min_snr_gamma,
-        args.perceptual_t_max,
     )
 
     if rank == 0:
