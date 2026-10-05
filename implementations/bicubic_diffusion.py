@@ -54,7 +54,7 @@ class DDPMScheduler:
 class PerceptualLoss(nn.Module):
     def __init__(self, device: str = "cuda"):
         super().__init__()
-        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K).features
+        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
         self.slices = nn.ModuleDict({
             "slice1": vgg[:4],
             "slice2": vgg[4:9],
