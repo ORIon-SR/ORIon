@@ -17,7 +17,9 @@ Usage:
 """
 
 import argparse
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -99,12 +101,68 @@ def select_patches(
     return coords
 
 
+def _process_single_image(
+    img_path: Path,
+    w: int,
+    h: int,
+    output_dir: Path,
+    split_name: str,
+    patch_size: int,
+    downscale_factor: int | None,
+) -> tuple[int, int]:
+    """Process one image: extract patches and save them. Returns (patches_extracted, skipped)."""
+    hr_out = output_dir / split_name / "HR"
+    lr_out = output_dir / split_name / "LR"
+
+    if not img_path.exists():
+        print(f"  warning: {img_path} not found, skipping", file=sys.stderr)
+        return 0, 1
+
+    if w < patch_size or h < patch_size:
+        print(
+            f"  warning: {img_path} ({w}x{h}) smaller than "
+            f"{patch_size}x{patch_size}, skipping",
+            file=sys.stderr,
+        )
+        return 0, 1
+
+    try:
+        img = Image.open(img_path).convert("RGB")
+        img_arr = np.array(img)
+        h, w = img_arr.shape[:2]
+    except Exception as exc:  # noqa: BLE001
+        print(f"  warning: could not open {img_path} ({exc})", file=sys.stderr)
+        return 0, 1
+
+    num_patches = patch_count(h, w)
+    patches = select_patches(img_arr, num_patches, patch_size=patch_size)
+    stem = img_path.stem
+
+    count = 0
+    for i, (y, x) in enumerate(patches):
+        name = f"{stem}_{i:04d}.png"
+        hr_patch = img.crop((x, y, x + patch_size, y + patch_size))
+        hr_patch.save(hr_out / name)
+
+        if downscale_factor is not None:
+            lr_patch_size = patch_size // downscale_factor
+            lr_patch = hr_patch.resize(
+                (lr_patch_size, lr_patch_size), Image.Resampling.BICUBIC
+            )
+            lr_patch.save(lr_out / name)
+
+        count += 1
+
+    return count, 0
+
+
 def process_split(
     split_name: str,
     records: list[tuple[Path, int, int]],
     output_dir: Path,
     patch_size: int,
     downscale_factor: int | None,
+    num_workers: int,
 ) -> int:
     hr_out = output_dir / split_name / "HR"
     hr_out.mkdir(parents=True, exist_ok=True)
@@ -114,48 +172,34 @@ def process_split(
 
     total = 0
     skipped = 0
-    for img_path, w, h in records:
-        if not img_path.exists():
-            print(f"  warning: {img_path} not found, skipping", file=sys.stderr)
-            skipped += 1
-            continue
 
-        if w < patch_size or h < patch_size:
-            print(
-                f"  warning: {img_path} ({w}x{h}) smaller than "
-                f"{patch_size}x{patch_size}, skipping",
-                file=sys.stderr,
+    if num_workers == 1:
+        for img_path, w, h in records:
+            count, skip = _process_single_image(
+                img_path, w, h, output_dir, split_name, patch_size, downscale_factor
             )
-            skipped += 1
-            continue
-
-        try:
-            img = Image.open(img_path).convert("RGB")
-            img_arr = np.array(img)
-            h, w = img_arr.shape[:2]
-        except Exception as exc:  # noqa: BLE001
-            print(f"  warning: could not open {img_path} ({exc})", file=sys.stderr)
-            skipped += 1
-            continue
-
-        num_patches = patch_count(h, w)
-        print(num_patches)
-        patches = select_patches(img_arr, num_patches, patch_size=patch_size)
-        stem = img_path.stem
-
-        for i, (y, x) in enumerate(patches):
-            name = f"{stem}_{i:04d}.png"
-            hr_patch = img.crop((x, y, x + patch_size, y + patch_size))
-            hr_patch.save(hr_out / name)
-
-            if downscale_factor is not None:
-                lr_patch_size = patch_size // downscale_factor
-                lr_patch = hr_patch.resize(
-                    (lr_patch_size, lr_patch_size), Image.Resampling.BICUBIC
+            total += count
+            skipped += skip
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(
+                    _process_single_image,
+                    img_path,
+                    w,
+                    h,
+                    output_dir,
+                    split_name,
+                    patch_size,
+                    downscale_factor,
                 )
-                lr_patch.save(lr_out / name)
+                for img_path, w, h in records
+            ]
+            for future in futures:
+                count, skip = future.result()
+                total += count
+                skipped += skip
 
-            total += 1
     print(f"  {split_name}: {total} patches ({skipped} images skipped)")
     return total
 
@@ -189,12 +233,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=42,
         help="Set seed for deterministic patch extraction",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes (default: CPU count). Use 1 for single-threaded.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None):
     args = parse_args(argv)
     np.random.seed(args.seed)
+
+    num_workers = args.num_workers if args.num_workers is not None else os.cpu_count()
+    print(f"Using {num_workers} worker process(es)")
 
     grand_total = 0
     for split_name in SPLIT_NAMES:
@@ -209,6 +262,7 @@ def main(argv: list[str] | None = None):
             args.output_dir,
             args.patch_size,
             args.downscale_factor,
+            num_workers,
         )
         grand_total += n
 
