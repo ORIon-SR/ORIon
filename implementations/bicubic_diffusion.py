@@ -141,6 +141,7 @@ def train_one_epoch(
 ):
     model.train()
     total_loss = 0.0
+    total_x0_mse = 0.0
 
     for batch_idx, (lr_imgs, hr_imgs) in enumerate(dataloader):
         lr_imgs = lr_imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -177,16 +178,30 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
+        # Matches validate's metric so the train/val loss pair is directly comparable
+        with torch.no_grad():
+            sqrt_alpha = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
+            sqrt_one_minus_alpha = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(
+                -1, 1, 1, 1
+            )
+            pred_x0 = (x_t - sqrt_one_minus_alpha * pred_noise.float()) / sqrt_alpha
+            x0_mse = F.mse_loss(pred_x0, hr_imgs)
+
         total_loss += loss.item()
+        total_x0_mse += x0_mse.item()
 
         if dist.get_rank() == 0 and (batch_idx + 1) % 20 == 0:
             print(
-                f"  Batch {batch_idx + 1}/{len(dataloader)} - Loss: {loss.item():.6f}"
+                f"  Batch {batch_idx + 1}/{len(dataloader)} - "
+                f"Loss: {loss.item():.6f} (x0 MSE: {x0_mse.item():.6f})"
             )
 
-    stats = torch.tensor([total_loss, float(len(dataloader))], device=device)
+    stats = torch.tensor(
+        [total_loss, total_x0_mse, float(len(dataloader))], device=device
+    )
     dist.all_reduce(stats)
-    return stats[0].item() / stats[1].item()
+    n = stats[2].item()
+    return stats[0].item() / n, stats[1].item() / n
 
 
 @torch.no_grad()
@@ -442,12 +457,12 @@ def train(
     for epoch in range(1, epochs + 1):
         last_epoch = epoch
         train_sampler.set_epoch(epoch)
-        train_loss = train_one_epoch(
+        train_loss, train_x0_mse = train_one_epoch(
             model, scheduler, train_loader, optimizer, scaler, device, amp_dtype,
             min_snr_gamma
         )
         val_generator.manual_seed(0)  # reset so t and noise are identical across epochs
-        val_loss, val_ssim, val_mae = validate(
+        val_x0_mse, val_ssim, val_mae = validate(
             model, scheduler, val_loader, device, amp_dtype, val_generator
         )
         lr_scheduler.step()
@@ -464,8 +479,8 @@ def train(
 
             print(
                 f"Epoch {epoch}/{epochs} - "
-                f"Train Loss: {train_loss:.6f} - "
-                f"Val Loss: {val_loss:.6f} - "
+                f"Train Loss: {train_loss:.6f} (x0 MSE: {train_x0_mse:.6f}) - "
+                f"Val Loss: {val_x0_mse:.6f} - "
                 f"Val MAE: {val_mae:.6f} - "
                 f"Val SSIM: {val_ssim:.6f} - "
                 f"LR: {current_lr:.2e} - "
@@ -476,7 +491,8 @@ def train(
                 {
                     "epoch": epoch,
                     "train/loss": train_loss,
-                    "val/loss": val_loss,
+                    "train/x0_mse": train_x0_mse,
+                    "val/x0_mse": val_x0_mse,
                     "val/mae": val_mae,
                     "val/ssim": val_ssim,
                     "train/lr": current_lr,
