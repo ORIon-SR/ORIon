@@ -36,6 +36,7 @@ class DDPMScheduler:
 
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        self.snr = self.alphas_cumprod / (1.0 - self.alphas_cumprod)
 
         self.posterior_variance = (
             self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
@@ -86,6 +87,39 @@ class PerceptualLoss(nn.Module):
             x_target = slice(x_target)
             loss += F.l1_loss(x_pred, x_target)
         return loss / len(self.slices)
+
+
+def compute_perceptual(
+    perceptual_loss: PerceptualLoss,
+    scheduler: DDPMScheduler,
+    pred_noise: torch.Tensor,
+    x_t: torch.Tensor,
+    hr_imgs: torch.Tensor,
+    t: torch.Tensor,
+    t_max: int,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+) -> torch.Tensor:
+    mask = t < t_max
+    if not mask.any():
+        return torch.tensor(0.0, device=device)
+
+    sqrt_alpha = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
+    sqrt_one_minus_alpha = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(-1, 1, 1, 1)
+    pred_x0 = (x_t - sqrt_one_minus_alpha * pred_noise) / sqrt_alpha
+
+    pred_sel = pred_x0[mask].float()
+    target_sel = hr_imgs[mask].float()
+    size = pred_sel.shape[-1]
+    crop = min(256, size)
+    if crop < size:
+        offset = torch.randint(0, size - crop + 1, (2,))
+        h, w = offset[0].item(), offset[1].item()
+        pred_sel = pred_sel[..., h : h + crop, w : w + crop]
+        target_sel = target_sel[..., h : h + crop, w : w + crop]
+
+    with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+        return perceptual_loss(pred_sel, target_sel)
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -166,7 +200,6 @@ class ConditionalUNet(nn.Module):
 
         self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)
         self.up_block2 = ResBlock(768, 256, time_dim)
-        self.attn_up2 = SelfAttention(256)
 
         self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
         self.up_block1 = ResBlock(384, 128, time_dim)
@@ -189,7 +222,6 @@ class ConditionalUNet(nn.Module):
 
         u2 = self.up2(mid)
         u2 = self.up_block2(torch.cat([u2, x4], dim=1), t_emb)
-        u2 = self.attn_up2(u2)
 
         u1 = self.up1(u2)
         u1 = self.up_block1(torch.cat([u1, x2], dim=1), t_emb)
@@ -198,7 +230,8 @@ class ConditionalUNet(nn.Module):
 
 
 def train_one_epoch(
-    model, scheduler, dataloader, optimizer, scaler, device, amp_dtype, perceptual_loss, perceptual_weight=0.1
+    model, scheduler, dataloader, optimizer, scaler, device, amp_dtype, perceptual_loss,
+    perceptual_weight=0.1, min_snr_gamma=5.0, perceptual_t_max=100
 ):
     model.train()
     total_loss = 0.0
@@ -230,17 +263,14 @@ def train_one_epoch(
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred_noise = model(model_input, t)
 
-        sqrt_alpha_cumprod = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
-        sqrt_one_minus_alpha_cumprod = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(
-            -1, 1, 1, 1
-        )
-        pred_x0 = (
-            x_t - sqrt_one_minus_alpha_cumprod * pred_noise
-        ) / sqrt_alpha_cumprod
+        weights = scheduler.snr[t].clamp(max=min_snr_gamma)
+        mse_loss = (weights[:, None, None, None] * (pred_noise.float() - noise) ** 2).mean()
 
-        mse_loss = F.mse_loss(pred_x0, hr_imgs)
         if perceptual_loss is not None:
-            perc_loss = perceptual_loss(pred_x0.float(), hr_imgs.float())
+            perc_loss = compute_perceptual(
+                perceptual_loss, scheduler, pred_noise, x_t, hr_imgs, t,
+                perceptual_t_max, device, amp_dtype
+            )
             loss = mse_loss + perceptual_weight * perc_loss
         else:
             perc_loss = torch.tensor(0.0, device=device)
@@ -263,11 +293,16 @@ def train_one_epoch(
                 f"Loss: {loss.item():.6f} (MSE: {mse_loss.item():.6f}, Perc: {perc_loss.item():.6f})"
             )
 
-    return total_loss / len(dataloader), total_mse / len(dataloader), total_perc / len(dataloader)
+    stats = torch.tensor(
+        [total_loss, total_mse, total_perc, float(len(dataloader))], device=device
+    )
+    dist.all_reduce(stats)
+    n = stats[3].item()
+    return stats[0].item() / n, stats[1].item() / n, stats[2].item() / n
 
 
 @torch.no_grad()
-def validate(model, scheduler, dataloader, device, amp_dtype):
+def validate(model, scheduler, dataloader, device, amp_dtype, generator):
     model.eval()
     total_loss = 0.0
     total_ssim = 0.0
@@ -289,9 +324,9 @@ def validate(model, scheduler, dataloader, device, amp_dtype):
         )
 
         t = torch.randint(
-            0, scheduler.num_timesteps, (batch_size,), device=device
-        ).long()
-        noise = torch.randn_like(hr_imgs_scaled)
+            0, scheduler.num_timesteps, (batch_size,), generator=generator
+        ).to(device)
+        noise = torch.randn(hr_imgs_scaled.shape, generator=generator).to(device)
         x_t = scheduler.add_noise(hr_imgs_scaled, noise, t)
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
@@ -319,9 +354,21 @@ def validate(model, scheduler, dataloader, device, amp_dtype):
             total_mae += F.l1_loss(pred_x0_img[i], hr_imgs[i]).item()
             num_samples += 1
 
-    avg_loss = total_loss / len(dataloader)
-    avg_ssim = total_ssim / num_samples if num_samples > 0 else 0.0
-    avg_mae = total_mae / num_samples if num_samples > 0 else 0.0
+    stats = torch.tensor(
+        [
+            total_loss,
+            total_ssim,
+            total_mae,
+            float(num_samples),
+            float(len(dataloader)),
+        ],
+        device=device,
+    )
+    dist.all_reduce(stats)
+
+    avg_loss = stats[0].item() / stats[4].item()
+    avg_ssim = stats[1].item() / stats[3].item() if stats[3].item() > 0 else 0.0
+    avg_mae = stats[2].item() / stats[3].item() if stats[3].item() > 0 else 0.0
 
     return avg_loss, avg_ssim, avg_mae
 
@@ -337,8 +384,9 @@ def sample_super_resolution(
     model.eval()
     device = lr_img.device
 
+    lr_imgs_scaled = lr_img * 2.0 - 1.0
     lr_conditioned = F.interpolate(
-        lr_img, size=target_size, mode="bicubic", align_corners=False
+        lr_imgs_scaled, size=target_size, mode="bicubic", align_corners=False
     )
 
     x_t = torch.randn((1, 3, target_size[0], target_size[1]), device=device)
@@ -377,6 +425,8 @@ def save_preview(
     save_path: Path,
     idx: int,
     epoch: int,
+    step: int,
+    commit: bool = False,
 ) -> None:
     def to_pil(tensor: torch.Tensor) -> Image.Image:
         arr = tensor.clamp(0, 1).mul(255).byte().cpu().numpy()
@@ -406,8 +456,8 @@ def save_preview(
                 combined, caption=f"LR | SR | HR - sample {idx} (epoch {epoch})"
             )
         },
-        step=epoch,
-        commit=False,
+        step=step,
+        commit=commit,
     )
 
 
@@ -420,9 +470,12 @@ def generate_previews(
     num_previews: int,
     epoch: int,
     amp_dtype: torch.dtype | None = None,
+    step: int | None = None,
+    commit: bool = False,
 ) -> None:
     model.eval()
     preview_count = 0
+    wandb_step = epoch if step is None else step
 
     with torch.no_grad():
         for lr_imgs, hr_imgs in test_loader:
@@ -439,7 +492,14 @@ def generate_previews(
                     model, scheduler, lr_imgs[i : i + 1], hr_size, amp_dtype
                 )
                 save_preview(
-                    lr_imgs[i], sr_img[0], hr_imgs[i], preview_dir, preview_count, epoch
+                    lr_imgs[i],
+                    sr_img[0],
+                    hr_imgs[i],
+                    preview_dir,
+                    preview_count,
+                    epoch,
+                    wandb_step,
+                    commit,
                 )
                 preview_count += 1
 
@@ -480,7 +540,9 @@ def train(
     amp_dtype: torch.dtype | None,
     perceptual_loss,
     perceptual_weight: float = 0.1,
-) -> None:
+    min_snr_gamma: float = 5.0,
+    perceptual_t_max: int = 100,
+) -> int:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=lr * 0.01
@@ -489,15 +551,19 @@ def train(
 
     best_val_ssim = 0.0
     patience_counter = 0
+    last_epoch = 0
+    val_generator = torch.Generator().manual_seed(0)
 
     for epoch in range(1, epochs + 1):
+        last_epoch = epoch
         train_sampler.set_epoch(epoch)
         train_loss, train_mse, train_perc = train_one_epoch(
             model, scheduler, train_loader, optimizer, scaler, device, amp_dtype,
-            perceptual_loss, perceptual_weight
+            perceptual_loss, perceptual_weight, min_snr_gamma, perceptual_t_max
         )
+        val_generator.manual_seed(0)  # reset so t and noise are identical across epochs
         val_loss, val_ssim, val_mae = validate(
-            model, scheduler, val_loader, device, amp_dtype
+            model, scheduler, val_loader, device, amp_dtype, val_generator
         )
         lr_scheduler.step()
 
@@ -534,6 +600,7 @@ def train(
                     "epochs_without_improvement": patience_counter,
                 },
                 step=epoch,
+                commit=False,
             )
 
             generate_previews(
@@ -549,10 +616,16 @@ def train(
 
         dist.barrier()
 
-        if patience_counter >= patience:
+        should_stop = torch.zeros(1, dtype=torch.int32, device=device)
+        if rank == 0:
+            should_stop[0] = int(patience_counter >= patience)
+        dist.broadcast(should_stop, src=0)
+        if should_stop.item() == 1:
             if rank == 0:
                 print(f"Early stopping at epoch {epoch}")
             break
+
+    return last_epoch
 
 
 def main() -> None:
@@ -609,6 +682,21 @@ def main() -> None:
         default=0.1,
         help="Weight for perceptual loss (0 to disable)",
     )
+    parser.add_argument(
+        "--min-snr-gamma",
+        type=float,
+        default=5.0,
+        help="Min-SNR weighting cap for the epsilon-MSE loss",
+    )
+    parser.add_argument(
+        "--perceptual-t-max",
+        type=int,
+        default=100,
+        help="Only apply perceptual loss for timesteps below this value",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed (offset per rank)"
+    )
     args = parser.parse_args()
 
     torch.backends.cudnn.benchmark = True
@@ -620,6 +708,8 @@ def main() -> None:
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{local_rank}")
 
+    torch.manual_seed(args.seed + rank)
+
     amp_dtype = None
     if args.amp:
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -628,6 +718,7 @@ def main() -> None:
         print(f"Using device: {device}, World size: {world_size}")
         print(f"AMP: {args.amp} (dtype: {amp_dtype}), torch.compile: {args.compile}")
         print(f"Perceptual weight: {args.perceptual_weight}, TF32: enabled")
+        print(f"Min-SNR gamma: {args.min_snr_gamma}, perceptual t < {args.perceptual_t_max}")
         wandb.init(
             project="ORIon-SR",
             name="Bicubic Diffusion DDP",
@@ -643,6 +734,9 @@ def main() -> None:
                 "amp_dtype": str(amp_dtype),
                 "compile": args.compile,
                 "perceptual_weight": args.perceptual_weight,
+                "min_snr_gamma": args.min_snr_gamma,
+                "perceptual_t_max": args.perceptual_t_max,
+                "seed": args.seed,
             },
         )
 
@@ -705,7 +799,7 @@ def main() -> None:
         args.save_path.parent.mkdir(parents=True, exist_ok=True)
         args.preview_dir.mkdir(parents=True, exist_ok=True)
 
-    train(
+    epochs_run = train(
         model,
         scheduler,
         train_loader,
@@ -723,6 +817,8 @@ def main() -> None:
         amp_dtype,
         perceptual_loss,
         args.perceptual_weight,
+        args.min_snr_gamma,
+        args.perceptual_t_max,
     )
 
     if rank == 0:
@@ -739,6 +835,8 @@ def main() -> None:
             args.num_previews,
             epoch=0,
             amp_dtype=amp_dtype,
+            step=epochs_run + 1,
+            commit=True,
         )
         wandb.finish()
 
