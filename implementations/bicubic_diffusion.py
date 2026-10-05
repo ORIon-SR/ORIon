@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 import wandb
 from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -50,6 +51,43 @@ class DDPMScheduler:
         return sqrt_alpha * x_start + sqrt_one_minus_alpha * noise
 
 
+class PerceptualLoss(nn.Module):
+    def __init__(self, device: str = "cuda"):
+        super().__init__()
+        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K).features
+        self.slices = nn.ModuleDict({
+            "slice1": vgg[:4],
+            "slice2": vgg[4:9],
+            "slice3": vgg[9:18],
+            "slice4": vgg[18:27],
+        })
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+        self.to(device)
+
+        self.register_buffer(
+            "mean", torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "std", torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        )
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = (pred * 0.5 + 0.5).clamp(0, 1)
+        target = (target * 0.5 + 0.5).clamp(0, 1)
+        pred = (pred - self.mean) / self.std
+        target = (target - self.mean) / self.std
+
+        loss = 0.0
+        x_pred, x_target = pred, target
+        for name, slice in self.slices.items():
+            x_pred = slice(x_pred)
+            x_target = slice(x_target)
+            loss += F.l1_loss(x_pred, x_target)
+        return loss / len(self.slices)
+
+
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -84,6 +122,24 @@ class ResBlock(nn.Module):
         return h + self.shortcut(x)
 
 
+class SelfAttention(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(32, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        q, k, v = self.qkv(h).chunk(3, dim=1)
+        q = q.reshape(B, C, -1).permute(0, 2, 1)
+        k = k.reshape(B, C, -1)
+        v = v.reshape(B, C, -1).permute(0, 2, 1)
+        out = F.scaled_dot_product_attention(q, k, v).permute(0, 2, 1).reshape(B, C, H, W)
+        return x + self.proj(out)
+
+
 class ConditionalUNet(nn.Module):
     def __init__(
         self, in_channels: int = 6, out_channels: int = 3, time_dim: int = 256
@@ -96,22 +152,26 @@ class ConditionalUNet(nn.Module):
             nn.SiLU(),
         )
 
-        self.in_conv = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
-        self.down1 = ResBlock(64, 128, time_dim)
-        self.pool1 = nn.Conv2d(128, 128, kernel_size=4, stride=2, padding=1)
+        self.in_conv = nn.Conv2d(in_channels, 128, kernel_size=3, padding=1)
+        self.down1 = ResBlock(128, 256, time_dim)
+        self.pool1 = nn.Conv2d(256, 256, kernel_size=4, stride=2, padding=1)
 
-        self.down2 = ResBlock(128, 256, time_dim)
-        self.pool2 = nn.Conv2d(256, 256, kernel_size=4, stride=2, padding=1)
+        self.down2 = ResBlock(256, 512, time_dim)
+        self.pool2 = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)
 
-        self.mid = ResBlock(256, 256, time_dim)
+        self.mid1 = ResBlock(512, 512, time_dim)
+        self.attn1 = SelfAttention(512)
+        self.mid2 = ResBlock(512, 512, time_dim)
+        self.attn2 = SelfAttention(512)
 
-        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
-        self.up_block2 = ResBlock(384, 128, time_dim)
+        self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)
+        self.up_block2 = ResBlock(768, 256, time_dim)
+        self.attn_up2 = SelfAttention(256)
 
-        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
-        self.up_block1 = ResBlock(192, 64, time_dim)
+        self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
+        self.up_block1 = ResBlock(384, 128, time_dim)
 
-        self.out_conv = nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
+        self.out_conv = nn.Conv2d(128, out_channels, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
         t_emb = self.time_mlp(time)
@@ -122,10 +182,14 @@ class ConditionalUNet(nn.Module):
         x4 = self.down2(x3, t_emb)
         x5 = self.pool2(x4)
 
-        mid = self.mid(x5, t_emb)
+        mid = self.mid1(x5, t_emb)
+        mid = self.attn1(mid)
+        mid = self.mid2(mid, t_emb)
+        mid = self.attn2(mid)
 
         u2 = self.up2(mid)
         u2 = self.up_block2(torch.cat([u2, x4], dim=1), t_emb)
+        u2 = self.attn_up2(u2)
 
         u1 = self.up1(u2)
         u1 = self.up_block1(torch.cat([u1, x2], dim=1), t_emb)
@@ -133,13 +197,17 @@ class ConditionalUNet(nn.Module):
         return self.out_conv(u1)
 
 
-def train_one_epoch(model, scheduler, dataloader, optimizer, scaler, device, amp_dtype):
+def train_one_epoch(
+    model, scheduler, dataloader, optimizer, scaler, device, amp_dtype, perceptual_loss, perceptual_weight=0.1
+):
     model.train()
     total_loss = 0.0
+    total_mse = 0.0
+    total_perc = 0.0
 
     for batch_idx, (lr_imgs, hr_imgs) in enumerate(dataloader):
-        lr_imgs = lr_imgs.to(device, non_blocking=True)
-        hr_imgs = hr_imgs.to(device, non_blocking=True)
+        lr_imgs = lr_imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        hr_imgs = hr_imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
 
         hr_imgs = hr_imgs * 2.0 - 1.0
         lr_imgs = lr_imgs * 2.0 - 1.0
@@ -170,7 +238,13 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, scaler, device, amp
             x_t - sqrt_one_minus_alpha_cumprod * pred_noise
         ) / sqrt_alpha_cumprod
 
-        loss = F.mse_loss(pred_x0, hr_imgs)
+        mse_loss = F.mse_loss(pred_x0, hr_imgs)
+        if perceptual_loss is not None:
+            perc_loss = perceptual_loss(pred_x0.float(), hr_imgs.float())
+            loss = mse_loss + perceptual_weight * perc_loss
+        else:
+            perc_loss = torch.tensor(0.0, device=device)
+            loss = mse_loss
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -180,11 +254,16 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, scaler, device, amp
         scaler.update()
 
         total_loss += loss.item()
+        total_mse += mse_loss.item()
+        total_perc += perc_loss.item()
 
         if (batch_idx + 1) % 20 == 0:
-            print(f"  Batch {batch_idx + 1}/{len(dataloader)} - Loss: {loss.item():.6f}")
+            print(
+                f"  Batch {batch_idx + 1}/{len(dataloader)} - "
+                f"Loss: {loss.item():.6f} (MSE: {mse_loss.item():.6f}, Perc: {perc_loss.item():.6f})"
+            )
 
-    return total_loss / len(dataloader)
+    return total_loss / len(dataloader), total_mse / len(dataloader), total_perc / len(dataloader)
 
 
 @torch.no_grad()
@@ -399,6 +478,8 @@ def train(
     rank: int,
     train_sampler,
     amp_dtype: torch.dtype | None,
+    perceptual_loss,
+    perceptual_weight: float = 0.1,
 ) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -411,8 +492,9 @@ def train(
 
     for epoch in range(1, epochs + 1):
         train_sampler.set_epoch(epoch)
-        train_loss = train_one_epoch(
-            model, scheduler, train_loader, optimizer, scaler, device, amp_dtype
+        train_loss, train_mse, train_perc = train_one_epoch(
+            model, scheduler, train_loader, optimizer, scaler, device, amp_dtype,
+            perceptual_loss, perceptual_weight
         )
         val_loss, val_ssim, val_mae = validate(
             model, scheduler, val_loader, device, amp_dtype
@@ -431,7 +513,7 @@ def train(
 
             print(
                 f"Epoch {epoch}/{epochs} - "
-                f"Train Loss: {train_loss:.6f} - "
+                f"Train Loss: {train_loss:.6f} (MSE: {train_mse:.6f}, Perc: {train_perc:.6f}) - "
                 f"Val Loss: {val_loss:.6f} - "
                 f"Val MAE: {val_mae:.6f} - "
                 f"Val SSIM: {val_ssim:.6f} - "
@@ -443,6 +525,8 @@ def train(
                 {
                     "epoch": epoch,
                     "train/loss": train_loss,
+                    "train/mse": train_mse,
+                    "train/perceptual": train_perc,
                     "val/loss": val_loss,
                     "val/mae": val_mae,
                     "val/ssim": val_ssim,
@@ -519,7 +603,17 @@ def main() -> None:
         default=True,
         help="Compile the model with torch.compile()",
     )
+    parser.add_argument(
+        "--perceptual-weight",
+        type=float,
+        default=0.1,
+        help="Weight for perceptual loss (0 to disable)",
+    )
     args = parser.parse_args()
+
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     local_rank = setup_ddp()
     rank = dist.get_rank()
@@ -533,6 +627,7 @@ def main() -> None:
     if rank == 0:
         print(f"Using device: {device}, World size: {world_size}")
         print(f"AMP: {args.amp} (dtype: {amp_dtype}), torch.compile: {args.compile}")
+        print(f"Perceptual weight: {args.perceptual_weight}, TF32: enabled")
         wandb.init(
             project="ORIon-SR",
             name="Bicubic Diffusion DDP",
@@ -547,6 +642,7 @@ def main() -> None:
                 "amp": args.amp,
                 "amp_dtype": str(amp_dtype),
                 "compile": args.compile,
+                "perceptual_weight": args.perceptual_weight,
             },
         )
 
@@ -568,27 +664,36 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         sampler=train_sampler,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
+        persistent_workers=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         sampler=val_sampler,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
+        persistent_workers=True,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         sampler=test_sampler,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
+        persistent_workers=True,
     )
 
     scheduler = DDPMScheduler(num_timesteps=args.num_timesteps, device=str(device))
-    model = ConditionalUNet().to(device)
+    model = ConditionalUNet().to(memory_format=torch.channels_last).to(device)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    perceptual_loss = None
+    if args.perceptual_weight > 0:
+        perceptual_loss = PerceptualLoss(device=str(device))
+        if rank == 0:
+            print("Perceptual loss (VGG19) initialized")
 
     if args.compile:
         if rank == 0:
@@ -616,6 +721,8 @@ def main() -> None:
         rank,
         train_sampler,
         amp_dtype,
+        perceptual_loss,
+        args.perceptual_weight,
     )
 
     if rank == 0:
