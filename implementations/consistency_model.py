@@ -184,9 +184,7 @@ def train_one_epoch(
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred_x0_2 = model(model_input_2, sigma_n_plus_1)
 
-        sigma_diff = (sigma_n_plus_1 - sigma_n).clamp(min=1e-6)
-        weights = 1.0 / sigma_diff
-        loss = (weights[:, None, None, None] * (pred_x0_1 - pred_x0_2.detach()) ** 2).mean()
+        loss = F.mse_loss(pred_x0_1, pred_x0_2.detach())
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -511,7 +509,7 @@ def main() -> None:
     parser.add_argument(
         "--epochs", type=int, default=100, help="Number of training epochs"
     )
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument(
         "--patience", type=int, default=10, help="Early stopping patience"
