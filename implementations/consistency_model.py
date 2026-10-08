@@ -184,7 +184,9 @@ def train_one_epoch(
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred_x0_2 = model(model_input_2, sigma_n_plus_1)
 
-        loss = F.mse_loss(pred_x0_1, pred_x0_2.detach())
+        sigma_diff = (sigma_n_plus_1 - sigma_n).clamp(min=1e-6)
+        weights = 1.0 / sigma_diff
+        loss = (weights[:, None, None, None] * (pred_x0_1 - pred_x0_2.detach()) ** 2).mean()
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
