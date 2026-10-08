@@ -143,6 +143,8 @@ def train_one_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     amp_dtype: torch.dtype | None,
+    num_noise_levels: int,
+    sigmas: torch.Tensor,
 ):
     model.train()
     total_loss = 0.0
@@ -162,9 +164,9 @@ def train_one_epoch(
             lr_imgs_scaled, size=hr_size, mode="bicubic", align_corners=False
         )
 
-        n = torch.randint(0, model.num_noise_levels - 1, (batch_size,), device=device)
-        sigma_n = model.sigmas[n]
-        sigma_n_plus_1 = model.sigmas[n + 1]
+        n = torch.randint(0, num_noise_levels - 1, (batch_size,), device=device)
+        sigma_n = sigmas[n]
+        sigma_n_plus_1 = sigmas[n + 1]
 
         noise = torch.randn_like(hr_imgs_scaled)
         x_t1 = hr_imgs_scaled + sigma_n[:, None, None, None] * noise
@@ -207,6 +209,7 @@ def validate(
     dataloader: DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype | None,
+    sigma_max: float,
 ):
     model.eval()
     total_ssim = 0.0
@@ -228,7 +231,7 @@ def validate(
             lr_imgs_scaled, size=hr_size, mode="bicubic", align_corners=False
         )
 
-        sigma = torch.full((batch_size,), model.sigma_max, device=device)
+        sigma = torch.full((batch_size,), sigma_max, device=device)
         noise = torch.randn_like(hr_imgs_scaled)
         x_t = hr_imgs_scaled + sigma[:, None, None, None] * noise
 
@@ -268,6 +271,7 @@ def sample_super_resolution(
     lr_img: torch.Tensor,
     target_size: tuple[int, int],
     amp_dtype: torch.dtype | None = None,
+    sigma_max: float = 80.0,
 ) -> torch.Tensor:
     model.eval()
     device = lr_img.device
@@ -278,7 +282,7 @@ def sample_super_resolution(
     )
 
     x_t = torch.randn((1, 3, target_size[0], target_size[1]), device=device)
-    sigma = torch.full((1,), model.sigma_max, device=device)
+    sigma = torch.full((1,), sigma_max, device=device)
 
     model_input = torch.cat([x_t, lr_conditioned], dim=1)
 
@@ -339,6 +343,7 @@ def generate_previews(
     num_previews: int,
     epoch: int,
     amp_dtype: torch.dtype | None = None,
+    sigma_max: float = 80.0,
     step: int | None = None,
     commit: bool = False,
 ) -> None:
@@ -358,7 +363,7 @@ def generate_previews(
                     break
 
                 sr_img = sample_super_resolution(
-                    model, lr_imgs[i : i + 1], hr_size, amp_dtype
+                    model, lr_imgs[i : i + 1], hr_size, amp_dtype, sigma_max
                 )
                 save_preview(
                     lr_imgs[i],
@@ -406,6 +411,9 @@ def train(
     rank: int,
     train_sampler,
     amp_dtype: torch.dtype | None,
+    num_noise_levels: int,
+    sigmas: torch.Tensor,
+    sigma_max: float,
 ) -> int:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -421,10 +429,11 @@ def train(
         last_epoch = epoch
         train_sampler.set_epoch(epoch)
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, scaler, device, amp_dtype
+            model, train_loader, optimizer, scaler, device, amp_dtype,
+            num_noise_levels, sigmas,
         )
         val_mse, val_ssim, val_mae = validate(
-            model, val_loader, device, amp_dtype
+            model, val_loader, device, amp_dtype, sigma_max
         )
         lr_scheduler.step()
 
@@ -470,6 +479,7 @@ def train(
                 num_previews,
                 epoch,
                 amp_dtype,
+                sigma_max,
             )
 
         dist.barrier()
@@ -637,6 +647,11 @@ def main() -> None:
         sigma_max=args.sigma_max,
         num_noise_levels=args.num_noise_levels,
     ).to(memory_format=torch.channels_last).to(device)
+    
+    num_noise_levels = model.num_noise_levels
+    sigmas = model.sigmas.clone()
+    sigma_max = model.sigma_max
+    
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     if args.compile:
@@ -664,6 +679,9 @@ def main() -> None:
         rank,
         train_sampler,
         amp_dtype,
+        num_noise_levels,
+        sigmas,
+        sigma_max,
     )
 
     if rank == 0:
@@ -679,6 +697,7 @@ def main() -> None:
             args.num_previews,
             epoch=0,
             amp_dtype=amp_dtype,
+            sigma_max=sigma_max,
             step=epochs_run + 1,
             commit=True,
         )
