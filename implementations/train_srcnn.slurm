@@ -15,4 +15,4 @@ echo "Activating venv"
 source /home-mscluster/$USER/ORIon/.venv/bin/activate
 
 echo "Running torchrun"
-torchrun --nproc-per-node=2 srcnn.py --batch-size 64
+torchrun --nproc-per-node=2 srcnn.py --batch-size 64 --scaling-factor 4

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=x16_diffusion
+#SBATCH --job-name=x4_diffusion
 #SBATCH --partition=prime
 #SBATCH --nodelist=phoenix
 #SBATCH --output=/home-mscluster/%u/ORIon/implementations/results/diffusion-output-%N-%j.txt
