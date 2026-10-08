@@ -111,12 +111,14 @@ class ConsistencyModel(nn.Module):
         sigma_max: float = 80.0,
         rho: float = 7.0,
         num_noise_levels: int = 150,
+        sigma_data: float = 0.5,
     ):
         super().__init__()
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.rho = rho
         self.num_noise_levels = num_noise_levels
+        self.sigma_data = sigma_data
         self.net = ConditionalUNet(in_channels, out_channels)
 
         sigmas = torch.zeros(num_noise_levels)
@@ -132,8 +134,19 @@ class ConsistencyModel(nn.Module):
         return ((sigma ** (1.0 / self.rho)) / (self.sigma_max ** (1.0 / self.rho))) * 1000.0
 
     def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        # EDM preconditioning: normalizes network input at high sigma and
+        # enforces the boundary condition f(x, sigma_min) = x at low sigma.
+        x_noisy = x[:, :3]
+        cond = x[:, 3:]
+        var = sigma**2 + self.sigma_data**2
+        c_in = 1.0 / torch.sqrt(var)
+        c_skip = self.sigma_data**2 / var
+        c_out = sigma * self.sigma_data / torch.sqrt(var)
+        scale = (slice(None), None, None, None)
         t = self.sigma_to_t(sigma)
-        return self.net(x, t)
+        net_in = torch.cat([c_in[scale] * x_noisy, cond], dim=1)
+        f = self.net(net_in, t)
+        return c_skip[scale] * x_noisy + c_out[scale] * f
 
 
 def train_one_epoch(
@@ -169,20 +182,18 @@ def train_one_epoch(
         sigma_n_plus_1 = sigmas[n + 1]
 
         noise = torch.randn_like(hr_imgs_scaled)
-        x_t1 = hr_imgs_scaled + sigma_n[:, None, None, None] * noise
+        x_t1 = hr_imgs_scaled + sigma_n_plus_1[:, None, None, None] * noise
+        x_t2 = hr_imgs_scaled + sigma_n[:, None, None, None] * noise
 
         model_input_1 = torch.cat([x_t1, lr_conditioned], dim=1)
-
-        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-            pred_x0_1 = model(model_input_1, sigma_n)
-
-        noise_2 = torch.randn_like(hr_imgs_scaled)
-        x_t2 = pred_x0_1.detach() + sigma_n_plus_1[:, None, None, None] * noise_2
-
         model_input_2 = torch.cat([x_t2, lr_conditioned], dim=1)
 
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-            pred_x0_2 = model(model_input_2, sigma_n_plus_1)
+            pred_x0_1 = model(model_input_1, sigma_n_plus_1)
+
+        with torch.no_grad():
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+                pred_x0_2 = model(model_input_2, sigma_n)
 
         loss = F.mse_loss(pred_x0_1, pred_x0_2.detach())
 
@@ -233,7 +244,7 @@ def validate(
 
         sigma = torch.full((batch_size,), sigma_max, device=device)
         noise = torch.randn_like(hr_imgs_scaled)
-        x_t = hr_imgs_scaled + sigma[:, None, None, None] * noise
+        x_t = sigma[:, None, None, None] * noise
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
 
@@ -281,7 +292,7 @@ def sample_super_resolution(
         lr_imgs_scaled, size=target_size, mode="bicubic", align_corners=False
     )
 
-    x_t = torch.randn((1, 3, target_size[0], target_size[1]), device=device)
+    x_t = sigma_max * torch.randn((1, 3, target_size[0], target_size[1]), device=device)
     sigma = torch.full((1,), sigma_max, device=device)
 
     model_input = torch.cat([x_t, lr_conditioned], dim=1)
@@ -509,7 +520,7 @@ def main() -> None:
     parser.add_argument(
         "--epochs", type=int, default=100, help="Number of training epochs"
     )
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument(
         "--patience", type=int, default=10, help="Early stopping patience"
