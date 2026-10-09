@@ -227,3 +227,6 @@ apod_data/*.tar.gz
 .python-version
 */results/
 */previews/
+
+# Local-only agent context, never commit
+AGENTS.md
