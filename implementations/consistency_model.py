@@ -110,25 +110,14 @@ class ConsistencyModel(nn.Module):
         sigma_min: float = 0.002,
         sigma_max: float = 80.0,
         rho: float = 7.0,
-        num_noise_levels: int = 150,
         sigma_data: float = 0.5,
     ):
         super().__init__()
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.rho = rho
-        self.num_noise_levels = num_noise_levels
         self.sigma_data = sigma_data
         self.net = ConditionalUNet(in_channels, out_channels)
-
-        sigmas = torch.zeros(num_noise_levels)
-        for i in range(num_noise_levels):
-            sigmas[i] = (
-                sigma_min ** (1.0 / rho)
-                + (i / (num_noise_levels - 1))
-                * (sigma_max ** (1.0 / rho) - sigma_min ** (1.0 / rho))
-            ) ** rho
-        self.register_buffer("sigmas", sigmas)
 
     def sigma_to_t(self, sigma: torch.Tensor) -> torch.Tensor:
         return ((sigma ** (1.0 / self.rho)) / (self.sigma_max ** (1.0 / self.rho))) * 1000.0
@@ -149,6 +138,24 @@ class ConsistencyModel(nn.Module):
         return c_skip[scale] * x_noisy + c_out[scale] * f
 
 
+def make_sigmas(
+    num_levels: int, sigma_min: float, sigma_max: float, rho: float, device
+) -> torch.Tensor:
+    i = torch.arange(num_levels, device=device)
+    base = sigma_min ** (1.0 / rho) + (i / (num_levels - 1)) * (
+        sigma_max ** (1.0 / rho) - sigma_min ** (1.0 / rho)
+    )
+    return base ** rho
+
+
+def num_discretization_steps(
+    step: int, total_steps: int, n_min: int, n_max: int
+) -> int:
+    # Doubling curriculum for N(k), Song & Dhariwal 2024 Sec. 3.4, Eq. 9
+    k_prime = max(1, total_steps // (int(round(math.log2(n_max / n_min))) + 1))
+    return min(n_min * 2 ** (step // k_prime), n_max) + 1
+
+
 def train_one_epoch(
     model: ConsistencyModel,
     dataloader: DataLoader,
@@ -156,12 +163,22 @@ def train_one_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     amp_dtype: torch.dtype | None,
-    num_noise_levels: int,
-    sigmas: torch.Tensor,
+    sigma_min: float,
+    sigma_max: float,
+    rho: float,
+    n_min: int,
+    n_max: int,
+    p_mean: float,
+    p_std: float,
+    epoch: int,
+    steps_per_epoch: int,
+    total_steps: int,
 ):
     model.train()
     total_loss = 0.0
     num_batches = 0
+    cur_levels = 0
+    sigmas = None
 
     for batch_idx, (lr_imgs, hr_imgs) in enumerate(dataloader):
         lr_imgs = lr_imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -177,9 +194,19 @@ def train_one_epoch(
             lr_imgs_scaled, size=hr_size, mode="bicubic", align_corners=False
         )
 
-        n = torch.randint(0, num_noise_levels - 1, (batch_size,), device=device)
+        step = (epoch - 1) * steps_per_epoch + batch_idx
+        levels = num_discretization_steps(step, total_steps, n_min, n_max)
+        if levels != cur_levels:
+            cur_levels = levels
+            sigmas = make_sigmas(levels, sigma_min, sigma_max, rho, device)
+
+        log_sigma = torch.randn(batch_size, device=device) * p_std + p_mean
+        n = (torch.searchsorted(sigmas, log_sigma.exp(), right=True) - 1).clamp(
+            0, levels - 2
+        )
         sigma_n = sigmas[n]
         sigma_n_plus_1 = sigmas[n + 1]
+        lam = 1.0 / (sigma_n_plus_1 - sigma_n)
 
         noise = torch.randn_like(hr_imgs_scaled)
         x_t1 = hr_imgs_scaled + sigma_n_plus_1[:, None, None, None] * noise
@@ -195,7 +222,12 @@ def train_one_epoch(
             with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
                 pred_x0_2 = model(model_input_2, sigma_n)
 
-        loss = F.mse_loss(pred_x0_1, pred_x0_2.detach())
+        # Pseudo-Huber metric (Song & Dhariwal 2024 Sec. 3.3): bounds the
+        # gradient contribution of outlier pairs that drive loss explosions.
+        c = 0.00054 * math.sqrt(hr_imgs_scaled[0].numel())
+        delta = (pred_x0_1 - pred_x0_2).float()
+        huber = torch.sqrt(delta.flatten(1).pow(2).sum(1) + c**2) - c
+        loss = (lam * huber).mean()
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -211,7 +243,7 @@ def train_one_epoch(
             print(f"  Batch {batch_idx + 1}/{len(dataloader)} - Loss: {loss.item():.6f}")
 
     avg_loss = total_loss / num_batches
-    return avg_loss
+    return avg_loss, cur_levels
 
 
 @torch.no_grad()
@@ -422,8 +454,12 @@ def train(
     rank: int,
     train_sampler,
     amp_dtype: torch.dtype | None,
-    num_noise_levels: int,
-    sigmas: torch.Tensor,
+    sigma_min: float,
+    rho: float,
+    n_min: int,
+    n_max: int,
+    p_mean: float,
+    p_std: float,
     sigma_max: float,
 ) -> int:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -435,13 +471,16 @@ def train(
     best_val_ssim = 0.0
     patience_counter = 0
     last_epoch = 0
+    steps_per_epoch = len(train_loader)
+    total_steps = epochs * steps_per_epoch
 
     for epoch in range(1, epochs + 1):
         last_epoch = epoch
         train_sampler.set_epoch(epoch)
-        train_loss = train_one_epoch(
+        train_loss, cur_levels = train_one_epoch(
             model, train_loader, optimizer, scaler, device, amp_dtype,
-            num_noise_levels, sigmas,
+            sigma_min, sigma_max, rho, n_min, n_max, p_mean, p_std,
+            epoch, steps_per_epoch, total_steps,
         )
         val_mse, val_ssim, val_mae = validate(
             model, val_loader, device, amp_dtype, sigma_max
@@ -476,6 +515,7 @@ def train(
                     "val/mae": val_mae,
                     "val/ssim": val_ssim,
                     "train/lr": current_lr,
+                    "train/N": cur_levels,
                     "epochs_without_improvement": patience_counter,
                 },
                 step=epoch,
@@ -553,10 +593,28 @@ def main() -> None:
         help="Maximum noise level",
     )
     parser.add_argument(
-        "--num-noise-levels",
+        "--n-min",
         type=int,
-        default=150,
-        help="Number of discretized noise levels (N in the paper)",
+        default=10,
+        help="Initial discretization levels s0 for the doubling curriculum",
+    )
+    parser.add_argument(
+        "--n-max",
+        type=int,
+        default=1280,
+        help="Final discretization levels s1 for the doubling curriculum",
+    )
+    parser.add_argument(
+        "--p-mean",
+        type=float,
+        default=-1.1,
+        help="Mean of the lognormal noise level sampling distribution",
+    )
+    parser.add_argument(
+        "--p-std",
+        type=float,
+        default=2.0,
+        help="Std dev of the lognormal noise level sampling distribution",
     )
     parser.add_argument(
         "--amp",
@@ -604,7 +662,10 @@ def main() -> None:
                 "patience": args.patience,
                 "sigma_min": args.sigma_min,
                 "sigma_max": args.sigma_max,
-                "num_noise_levels": args.num_noise_levels,
+                "n_min": args.n_min,
+                "n_max": args.n_max,
+                "p_mean": args.p_mean,
+                "p_std": args.p_std,
                 "world_size": world_size,
                 "device": str(device),
                 "amp": args.amp,
@@ -656,13 +717,11 @@ def main() -> None:
     model = ConsistencyModel(
         sigma_min=args.sigma_min,
         sigma_max=args.sigma_max,
-        num_noise_levels=args.num_noise_levels,
     ).to(memory_format=torch.channels_last).to(device)
-    
-    num_noise_levels = model.num_noise_levels
-    sigmas = model.sigmas.clone()
+
+    rho = model.rho
     sigma_max = model.sigma_max
-    
+
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     if args.compile:
@@ -690,8 +749,12 @@ def main() -> None:
         rank,
         train_sampler,
         amp_dtype,
-        num_noise_levels,
-        sigmas,
+        args.sigma_min,
+        rho,
+        args.n_min,
+        args.n_max,
+        args.p_mean,
+        args.p_std,
         sigma_max,
     )
 

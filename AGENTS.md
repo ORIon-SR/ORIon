@@ -76,10 +76,11 @@ ORIon/
 ### Consistency Model (`implementations/consistency_model.py`)
 - Same ConditionalUNet architecture as diffusion model (2-level encoder-decoder, sinusoidal time embeddings)
 - 6 input channels (3 noisy HR + 3 bicubic LR condition), 3 output channels
-- Training: consistency training (Song & Dhariwal 2023) — sample adjacent noise levels σ_n < σ_{n+1}, online prediction at σ_{n+1}, stop-gradient target at σ_n, both noised from the true HR with shared noise
+- Training: improved consistency training (Song & Dhariwal 2024, iCT) — sample adjacent noise levels σ_n < σ_{n+1} from a discretized lognormal (P_mean=-1.1, P_sd=2.0), online prediction at σ_{n+1}, stop-gradient target at σ_n from the same weights (teacher EMA μ=0), both noised from the true HR with shared noise
+- Loss: λ(σ_n) · Pseudo-Huber(‖Δ‖₂, c=0.00054·√d) with weighting λ(σ_n) = 1/(σ_{n+1}−σ_n); Pseudo-Huber bounds outlier-pair gradients that otherwise explode the squared-ℓ₂ objective
+- Discretization: doubling curriculum N(k) = min(s0·2^⌊k/K'⌋, s1)+1 with s0=10, s1=1280 (`--n-min`/`--n-max`), σ ∈ [0.002, 80.0], ρ=7.0
 - EDM preconditioning (c_in/c_out/c_skip, σ_data=0.5): normalizes network input at high σ and enforces the boundary condition f(x, σ_min)=x; c_in/c_skip apply only to the noisy-HR channels, the LR condition passes through unscaled
 - Inference: single-step denoising from x_T = σ_max·ε conditioned on bicubic-interpolated LR (no iterative sampling needed)
-- Noise schedule: 150 discretized levels, σ ∈ [0.002, 80.0], ρ=7.0
 - Checkpoint: `checkpoints/consistency_best.pth` (not yet saved — model not yet trained)
 
 ## Shared Components
