@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rungs 1-5 evaluation -- trained models + bicubic baseline + Swin2SR zero-shot on the APOD test split.
+"""Rungs 1-6 evaluation -- trained models + bicubic baseline + Swin2SR zero-shot on the APOD test split.
 
 Evaluates the same way as ``swin2sr_eval.py`` so all rungs are directly comparable:
 
@@ -11,16 +11,18 @@ Evaluates the same way as ``swin2sr_eval.py`` so all rungs are directly comparab
 
 Models evaluated:
 
-  * bicubic          (rung 1 baseline)
-  * srcnn            (rung 2, trained checkpoint)
-  * diffusion        (rung 3, trained checkpoint, iterative sampling)
-  * consistency      (rung 4, trained checkpoint, single-step sampling)
-  * swin2sr          (rung 5, pretrained zero-shot)
+  * bicubic              (rung 1 baseline)
+  * srcnn                (rung 2, trained checkpoint)
+  * diffusion            (rung 3, trained checkpoint, iterative sampling)
+  * consistency          (rung 4, trained checkpoint, single-step sampling)
+  * consistency_2step    (rung 4b, same weights, 2-step sampling)
+  * consistency_4step    (rung 4c, same weights, 4-step sampling)
+  * swin2sr              (rung 5, pretrained zero-shot)
 
 Run from ``implementations/``:
 
     python models_eval.py --split test --limit 16              # smoke test
-    python models_eval.py --split test --models srcnn diffusion consistency swin2sr
+    python models_eval.py --split test --models srcnn diffusion consistency consistency_2step consistency_4step swin2sr
     python models_eval.py --split test --wandb                 # the real run
 
 Checkpoints are loaded from ``checkpoints/`` by default.
@@ -166,6 +168,48 @@ class ConsistencyModelWrapper:
         return out.clamp(0, 1)
 
 
+class ConsistencyFewStep:
+    """Rung 4b/4c. Consistency model with few-step (2 or 4 steps) sampling."""
+
+    def __init__(self, checkpoint_path: Path, device: torch.device, num_steps: int, sigma_max: float = 80.0):
+        from consistency_model import ConsistencyModel, make_sigmas
+
+        self.model = ConsistencyModel(sigma_max=sigma_max).to(device).eval()
+        state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        self.model.load_state_dict(state)
+        self.device = device
+        self.num_steps = num_steps
+        self.sigma_max = sigma_max
+        self.sigma_min = self.model.sigma_min
+        self.rho = self.model.rho
+        self.name = f"consistency_{num_steps}step"
+
+        # Pre-compute sigma schedule for the given number of steps
+        self.sigmas = make_sigmas(num_steps + 1, self.sigma_min, sigma_max, self.rho, device)
+
+    @torch.inference_mode()
+    def __call__(self, lr: torch.Tensor) -> torch.Tensor:
+        batch_size = lr.size(0)
+        hr_size = (lr.shape[-2] * SCALE, lr.shape[-1] * SCALE)
+
+        lr_scaled = lr * 2.0 - 1.0
+        lr_conditioned = F.interpolate(
+            lr_scaled, size=hr_size, mode="bicubic", align_corners=False
+        )
+
+        # Start at highest noise level
+        x_t = self.sigmas[0] * torch.randn((batch_size, 3, hr_size[0], hr_size[1]), device=self.device)
+
+        # Iterate through sigma levels
+        for i in range(self.num_steps):
+            sigma = self.sigmas[i].expand(batch_size)
+            model_input = torch.cat([x_t, lr_conditioned], dim=1)
+            x_t = self.model(model_input, sigma).float()
+
+        out = (x_t + 1.0) / 2.0
+        return out.clamp(0, 1)
+
+
 class Swin2SRZeroShot:
     """Rung 5. Pretrained Swin2SR x4, used as-is."""
 
@@ -255,8 +299,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-dir", type=Path, default=project_root / "apod_data" / "dataset")
     p.add_argument("--split", choices=["train", "val", "test"], default="test")
     p.add_argument("--models", nargs="+",
-                   choices=["bicubic", "srcnn", "diffusion", "consistency", "swin2sr"],
-                   default=["bicubic", "srcnn", "diffusion", "consistency", "swin2sr"])
+                   choices=["bicubic", "srcnn", "diffusion", "consistency", "consistency_2step", "consistency_4step", "swin2sr"],
+                   default=["bicubic", "srcnn", "diffusion", "consistency", "consistency_2step", "consistency_4step", "swin2sr"])
     p.add_argument("--checkpoint-dir", type=Path, default=Path(__file__).resolve().parent / "checkpoints")
     p.add_argument("--srcnn-checkpoint", type=Path, default=None)
     p.add_argument("--diffusion-checkpoint", type=Path, default=None)
@@ -293,6 +337,12 @@ def load_model(name: str, args, device: torch.device):
     elif name == "consistency":
         path = args.consistency_checkpoint or (ckpt_dir / "consistency_best.pth")
         return ConsistencyModelWrapper(path, device, args.consistency_sigma_max)
+    elif name == "consistency_2step":
+        path = args.consistency_checkpoint or (ckpt_dir / "consistency_best.pth")
+        return ConsistencyFewStep(path, device, num_steps=2, sigma_max=args.consistency_sigma_max)
+    elif name == "consistency_4step":
+        path = args.consistency_checkpoint or (ckpt_dir / "consistency_best.pth")
+        return ConsistencyFewStep(path, device, num_steps=4, sigma_max=args.consistency_sigma_max)
     elif name == "swin2sr":
         return Swin2SRZeroShot(args.model_id, args.revision, device)
     else:
@@ -344,35 +394,51 @@ def main() -> None:
                         name=args.wandb_name, config=config)
 
     rows: list[dict] = []
-    seen, previews_done, t0 = 0, 0, time.time()
-    with torch.inference_mode():
-        for lr, hr in loader:
-            lr, hr = lr.to(device, non_blocking=True), hr.to(device, non_blocking=True)
-            batch_names = filenames[seen: seen + lr.size(0)]
-            for m in models:
-                sr = m(lr)
+    previews_done = 0
+    t0 = time.time()
+
+    # Evaluate models sequentially to avoid OOM (especially for diffusion's 1000-step sampling)
+    for model in models:
+        print(f"\nEvaluating {model.name}...")
+        seen = 0
+        with torch.inference_mode():
+            for lr, hr in loader:
+                lr, hr = lr.to(device, non_blocking=True), hr.to(device, non_blocking=True)
+                batch_names = filenames[seen: seen + lr.size(0)]
+
+                sr = model(lr)
                 if sr.shape != hr.shape:
-                    raise SystemExit(f"{m.name}: output {tuple(sr.shape)} != HR {tuple(hr.shape)}")
+                    raise SystemExit(f"{model.name}: output {tuple(sr.shape)} != HR {tuple(hr.shape)}")
+
                 for i, fn in enumerate(batch_names):
                     rows.append(dict(
-                        patch=fn, source=source_of(fn), model=m.name,
+                        patch=fn, source=source_of(fn), model=model.name,
                         psnr=compute_psnr(sr[i], hr[i]),
                         ssim=compute_ssim(sr[i], hr[i]),
                         mae=F.l1_loss(sr[i], hr[i]).item(),
                     ))
-                if m.name != "bicubic" or names == ["bicubic"]:
+
+                if model.name != "bicubic" or names == ["bicubic"]:
                     for i, fn in enumerate(batch_names):
                         if previews_done + i >= args.num_previews:
                             break
                         img = save_preview(lr[i], sr[i], hr[i],
-                                           out_dir / "previews" / f"{m.name}_{fn}")
+                                           out_dir / "previews" / f"{model.name}_{fn}")
                         if wb is not None:
                             import wandb
-                            wb.log({f"preview/{m.name}/{previews_done + i}": wandb.Image(
-                                img, caption=f"LR | {m.name} | HR - {fn}")})
-            previews_done += min(len(batch_names), max(0, args.num_previews - previews_done))
-            seen += lr.size(0)
-            print(f"  {seen}/{len(filenames)} patches ({time.time() - t0:.0f}s)")
+                            wb.log({f"preview/{model.name}/{previews_done + i}": wandb.Image(
+                                img, caption=f"LR | {model.name} | HR - {fn}")})
+
+                previews_done += min(len(batch_names), max(0, args.num_previews - previews_done))
+                seen += lr.size(0)
+                print(f"  {seen}/{len(filenames)} patches ({time.time() - t0:.0f}s)")
+
+        # Clear GPU memory before loading next model
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        import gc
+        gc.collect()
 
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["patch", "source", "model", *METRICS])
