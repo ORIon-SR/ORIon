@@ -257,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--models", nargs="+",
                    choices=["bicubic", "srcnn", "diffusion", "consistency", "swin2sr"],
                    default=["bicubic", "srcnn", "diffusion", "consistency", "swin2sr"])
-    p.add_argument("--checkpoint-dir", type=Path, default=project_root / "checkpoints")
+    p.add_argument("--checkpoint-dir", type=Path, default=Path(__file__).resolve().parent / "checkpoints")
     p.add_argument("--srcnn-checkpoint", type=Path, default=None)
     p.add_argument("--diffusion-checkpoint", type=Path, default=None)
     p.add_argument("--consistency-checkpoint", type=Path, default=None)
