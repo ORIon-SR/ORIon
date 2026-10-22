@@ -2,8 +2,8 @@
 #SBATCH --job-name=models_eval
 #SBATCH --partition=prime
 #SBATCH --nodelist=phoenix
-#SBATCH --output=/home-mscluster/%u/ORIon/scripts/results/eval-output-%N-%j.txt
-#SBATCH --error=/home-mscluster/%u/ORIon/scripts/results/eval-error-%N-%j.txt
+#SBATCH --output=/home-mscluster/%u/ORIon/implementations/results/eval-output-%N-%j.txt
+#SBATCH --error=/home-mscluster/%u/ORIon/implementations/results/eval-error-%N-%j.txt
 
 set -euo pipefail
 

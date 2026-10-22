@@ -312,6 +312,8 @@ def parse_args() -> argparse.Namespace:
                    help="Swin2SR Hub id or local folder")
     p.add_argument("--revision", default=None, help="Pin a Hub commit/tag for Swin2SR reproducibility")
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--diffusion-batch-size", type=int, default=2,
+                   help="Batch size for diffusion model (default: 2, lower than others due to 1000-step sampling)")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--limit", type=int, default=0, help="Only the first N patches (smoke test)")
     p.add_argument("--out-dir", type=Path, default=Path("results/models_eval"))
@@ -363,14 +365,12 @@ def main() -> None:
     if args.limit:
         dataset.filenames = dataset.filenames[: args.limit]
     filenames = dataset.filenames
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers, pin_memory=device.type == "cuda")
 
     models = []
     for name in args.models:
         models.append(load_model(name, args, device))
     names = [m.name for m in models]
-    print(f"{dataset} | device={device} | models={names} | {len(filenames)} patches")
+    print(f"{dataset} | device={device} | models={names} | {len(filenames)} patches | batch_size={args.batch_size} (diffusion={args.diffusion_batch_size})")
 
     wb = None
     config = dict(
@@ -380,6 +380,7 @@ def main() -> None:
         split=args.split,
         n_patches=len(filenames),
         batch_size=args.batch_size,
+        diffusion_batch_size=args.diffusion_batch_size,
         metric_conventions=CONVENTIONS,
         srcnn_upscale_factor=args.srcnn_upscale_factor,
         diffusion_timesteps=args.diffusion_timesteps,
@@ -400,6 +401,12 @@ def main() -> None:
     # Evaluate models sequentially to avoid OOM (especially for diffusion's 1000-step sampling)
     for model in models:
         print(f"\nEvaluating {model.name}...")
+
+        # Use smaller batch size for diffusion model to avoid OOM
+        batch_size = args.diffusion_batch_size if model.name == "diffusion" else args.batch_size
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=device.type == "cuda")
+
         seen = 0
         with torch.inference_mode():
             for lr, hr in loader:
