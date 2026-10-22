@@ -370,7 +370,7 @@ def main() -> None:
     for name in args.models:
         models.append(load_model(name, args, device))
     names = [m.name for m in models]
-    print(f"{dataset} | device={device} | models={names} | {len(filenames)} patches | batch_size={args.batch_size} (diffusion={args.diffusion_batch_size})")
+    print(f"{dataset} | device={device} | models={names} | {len(filenames)} patches | batch_size={args.batch_size} (diffusion/consistency={args.diffusion_batch_size})")
 
     wb = None
     config = dict(
@@ -400,10 +400,10 @@ def main() -> None:
 
     # Evaluate models sequentially to avoid OOM (especially for diffusion's 1000-step sampling)
     for model in models:
-        print(f"\nEvaluating {model.name}...")
+        print(f"\nEvaluating {model.name}...", flush=True)
 
-        # Use smaller batch size for diffusion model to avoid OOM
-        batch_size = args.diffusion_batch_size if model.name == "diffusion" else args.batch_size
+        # Use smaller batch size for diffusion and consistency models to avoid OOM
+        batch_size = args.diffusion_batch_size if model.name in ("diffusion", "consistency", "consistency_2step", "consistency_4step") else args.batch_size
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=device.type == "cuda")
 
@@ -438,7 +438,8 @@ def main() -> None:
 
                 previews_done += min(len(batch_names), max(0, args.num_previews - previews_done))
                 seen += lr.size(0)
-                print(f"  {seen}/{len(filenames)} patches ({time.time() - t0:.0f}s)")
+                print(f"\r  {seen}/{len(filenames)} patches ({time.time() - t0:.0f}s)", end="", flush=True)
+            print()
 
         # Clear GPU memory before loading next model
         del model
