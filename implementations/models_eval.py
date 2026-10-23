@@ -155,7 +155,8 @@ class ConsistencyModelWrapper:
 
     name = "consistency"
 
-    def __init__(self, checkpoint_path: Path, device: torch.device, sigma_max: float = 80.0):
+    def __init__(self, checkpoint_path: Path, device: torch.device, sigma_max: float = 80.0,
+                 compile: bool = True, amp: bool = True):
         from consistency_model import ConsistencyModel
 
         self.model = ConsistencyModel(sigma_max=sigma_max).to(device).eval()
@@ -163,6 +164,13 @@ class ConsistencyModelWrapper:
         self.model.load_state_dict(state)
         self.device = device
         self.sigma_max = sigma_max
+
+        self.amp_dtype = None
+        if amp and device.type == "cuda":
+            self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        if compile and device.type == "cuda":
+            self.model = torch.compile(self.model)
 
     @torch.inference_mode()
     def __call__(self, lr: torch.Tensor) -> torch.Tensor:
@@ -178,7 +186,9 @@ class ConsistencyModelWrapper:
         sigma = torch.full((batch_size,), self.sigma_max, device=self.device)
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
-        pred_x0 = self.model(model_input, sigma).float()
+        with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.amp_dtype is not None):
+            pred_x0 = self.model(model_input, sigma)
+        pred_x0 = pred_x0.float()
 
         out = (pred_x0 + 1.0) / 2.0
         return out.clamp(0, 1)
@@ -187,7 +197,8 @@ class ConsistencyModelWrapper:
 class ConsistencyFewStep:
     """Rung 4b/4c. Consistency model with few-step (2 or 4 steps) sampling."""
 
-    def __init__(self, checkpoint_path: Path, device: torch.device, num_steps: int, sigma_max: float = 80.0):
+    def __init__(self, checkpoint_path: Path, device: torch.device, num_steps: int, sigma_max: float = 80.0,
+                 compile: bool = True, amp: bool = True):
         from consistency_model import ConsistencyModel, make_sigmas
 
         self.model = ConsistencyModel(sigma_max=sigma_max).to(device).eval()
@@ -199,6 +210,13 @@ class ConsistencyFewStep:
         self.sigma_min = self.model.sigma_min
         self.rho = self.model.rho
         self.name = f"consistency_{num_steps}step"
+
+        self.amp_dtype = None
+        if amp and device.type == "cuda":
+            self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        if compile and device.type == "cuda":
+            self.model = torch.compile(self.model)
 
         # Pre-compute sigma schedule for the given number of steps
         self.sigmas = make_sigmas(num_steps + 1, self.sigma_min, sigma_max, self.rho, device)
@@ -220,7 +238,9 @@ class ConsistencyFewStep:
         for i in range(self.num_steps):
             sigma = self.sigmas[i].expand(batch_size)
             model_input = torch.cat([x_t, lr_conditioned], dim=1)
-            x_t = self.model(model_input, sigma).float()
+            with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.amp_dtype is not None):
+                x_t = self.model(model_input, sigma)
+            x_t = x_t.float()
 
         out = (x_t + 1.0) / 2.0
         return out.clamp(0, 1)
@@ -328,6 +348,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--diffusion-amp", action=argparse.BooleanOptionalAction, default=True,
                    help="Run diffusion UNet forward passes under autocast (bf16/fp16)")
     p.add_argument("--consistency-sigma-max", type=float, default=80.0)
+    p.add_argument("--consistency-compile", action=argparse.BooleanOptionalAction, default=True,
+                   help="torch.compile the consistency model for faster inference")
+    p.add_argument("--consistency-amp", action=argparse.BooleanOptionalAction, default=True,
+                   help="Run consistency model forward passes under autocast (bf16/fp16)")
     p.add_argument("--model-id", default="caidas/swin2SR-classical-sr-x4-64",
                    help="Swin2SR Hub id or local folder")
     p.add_argument("--revision", default=None, help="Pin a Hub commit/tag for Swin2SR reproducibility")
@@ -359,13 +383,16 @@ def load_model(name: str, args, device: torch.device):
                               compile=args.diffusion_compile, amp=args.diffusion_amp)
     elif name == "consistency":
         path = args.consistency_checkpoint or (ckpt_dir / "consistency_best.pth")
-        return ConsistencyModelWrapper(path, device, args.consistency_sigma_max)
+        return ConsistencyModelWrapper(path, device, args.consistency_sigma_max,
+                                       compile=args.consistency_compile, amp=args.consistency_amp)
     elif name == "consistency_2step":
         path = args.consistency_checkpoint or (ckpt_dir / "consistency_best.pth")
-        return ConsistencyFewStep(path, device, num_steps=2, sigma_max=args.consistency_sigma_max)
+        return ConsistencyFewStep(path, device, num_steps=2, sigma_max=args.consistency_sigma_max,
+                                  compile=args.consistency_compile, amp=args.consistency_amp)
     elif name == "consistency_4step":
         path = args.consistency_checkpoint or (ckpt_dir / "consistency_best.pth")
-        return ConsistencyFewStep(path, device, num_steps=4, sigma_max=args.consistency_sigma_max)
+        return ConsistencyFewStep(path, device, num_steps=4, sigma_max=args.consistency_sigma_max,
+                                  compile=args.consistency_compile, amp=args.consistency_amp)
     elif name == "swin2sr":
         return Swin2SRZeroShot(args.model_id, args.revision, device)
     else:
@@ -412,6 +439,8 @@ def main() -> None:
         diffusion_compile=args.diffusion_compile,
         diffusion_amp=args.diffusion_amp,
         consistency_sigma_max=args.consistency_sigma_max,
+        consistency_compile=args.consistency_compile,
+        consistency_amp=args.consistency_amp,
         swin2sr_model_id=args.model_id,
         swin2sr_revision=args.revision,
         torch=torch.__version__,
