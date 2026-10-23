@@ -88,7 +88,14 @@ class DiffusionModel:
 
     name = "diffusion"
 
-    def __init__(self, checkpoint_path: Path, device: torch.device, num_timesteps: int = 1000):
+    def __init__(
+        self,
+        checkpoint_path: Path,
+        device: torch.device,
+        num_timesteps: int = 1000,
+        compile: bool = True,
+        amp: bool = True,
+    ):
         from bicubic_diffusion import ConditionalUNet, DDPMScheduler
 
         self.net = ConditionalUNet().to(device).eval()
@@ -97,6 +104,13 @@ class DiffusionModel:
         self.scheduler = DDPMScheduler(num_timesteps=num_timesteps, device=str(device))
         self.device = device
         self.num_timesteps = num_timesteps
+
+        self.amp_dtype = None
+        if amp and device.type == "cuda":
+            self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        if compile and device.type == "cuda":
+            self.net = torch.compile(self.net)
 
     @torch.inference_mode()
     def __call__(self, lr: torch.Tensor) -> torch.Tensor:
@@ -113,7 +127,9 @@ class DiffusionModel:
         for t_idx in reversed(range(self.num_timesteps)):
             t = torch.full((batch_size,), t_idx, device=self.device, dtype=torch.long)
             model_input = torch.cat([x_t, lr_conditioned], dim=1)
-            pred_noise = self.net(model_input, t).float()
+            with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.amp_dtype is not None):
+                pred_noise = self.net(model_input, t)
+            pred_noise = pred_noise.float()
 
             beta = self.scheduler.betas[t_idx]
             alpha = self.scheduler.alphas[t_idx]
@@ -307,6 +323,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--consistency-checkpoint", type=Path, default=None)
     p.add_argument("--srcnn-upscale-factor", type=int, default=4)
     p.add_argument("--diffusion-timesteps", type=int, default=1000)
+    p.add_argument("--diffusion-compile", action=argparse.BooleanOptionalAction, default=True,
+                   help="torch.compile the diffusion UNet for faster inference")
+    p.add_argument("--diffusion-amp", action=argparse.BooleanOptionalAction, default=True,
+                   help="Run diffusion UNet forward passes under autocast (bf16/fp16)")
     p.add_argument("--consistency-sigma-max", type=float, default=80.0)
     p.add_argument("--model-id", default="caidas/swin2SR-classical-sr-x4-64",
                    help="Swin2SR Hub id or local folder")
@@ -335,7 +355,8 @@ def load_model(name: str, args, device: torch.device):
         return SRCNNModel(path, device, args.srcnn_upscale_factor)
     elif name == "diffusion":
         path = args.diffusion_checkpoint or (ckpt_dir / "diffusion_best.pth")
-        return DiffusionModel(path, device, args.diffusion_timesteps)
+        return DiffusionModel(path, device, args.diffusion_timesteps,
+                              compile=args.diffusion_compile, amp=args.diffusion_amp)
     elif name == "consistency":
         path = args.consistency_checkpoint or (ckpt_dir / "consistency_best.pth")
         return ConsistencyModelWrapper(path, device, args.consistency_sigma_max)
@@ -354,6 +375,10 @@ def load_model(name: str, args, device: torch.device):
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     out_dir = args.out_dir / args.split
     csv_path = out_dir / "per_patch.csv"
@@ -384,6 +409,8 @@ def main() -> None:
         metric_conventions=CONVENTIONS,
         srcnn_upscale_factor=args.srcnn_upscale_factor,
         diffusion_timesteps=args.diffusion_timesteps,
+        diffusion_compile=args.diffusion_compile,
+        diffusion_amp=args.diffusion_amp,
         consistency_sigma_max=args.consistency_sigma_max,
         swin2sr_model_id=args.model_id,
         swin2sr_revision=args.revision,
