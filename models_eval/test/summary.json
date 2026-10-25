@@ -1,0 +1,249 @@
+{
+  "config": {
+    "models": [
+      "bicubic",
+      "srcnn",
+      "diffusion",
+      "consistency",
+      "consistency_2step",
+      "consistency_4step",
+      "swin2sr"
+    ],
+    "scale_factor": 4,
+    "dataset": "nasa-apod",
+    "split": "test",
+    "n_patches": 9902,
+    "batch_size": 8,
+    "diffusion_batch_size": 64,
+    "metric_conventions": "float [0,1], output clamped, no border shave, no uint8 rounding; SSIM = metrics.compute_ssim; PSNR = 10*log10(1/MSE) per patch; mean over patches",
+    "srcnn_upscale_factor": 4,
+    "diffusion_timesteps": 1000,
+    "diffusion_compile": true,
+    "diffusion_amp": true,
+    "consistency_sigma_max": 80.0,
+    "consistency_compile": true,
+    "consistency_amp": true,
+    "swin2sr_model_id": "caidas/swin2SR-classical-sr-x4-64",
+    "swin2sr_revision": null,
+    "torch": "2.14.1+cu130"
+  },
+  "results": {
+    "bicubic": {
+      "n_patches": 9902,
+      "n_images": 251,
+      "psnr": {
+        "patch_mean": 33.93739495287905,
+        "patch_std": 5.850725791682511,
+        "image_mean": 32.4554368368572,
+        "image_ci95": [
+          31.7885325025849,
+          33.197635590098585
+        ]
+      },
+      "ssim": {
+        "patch_mean": 0.8423024754323422,
+        "patch_std": 0.14029429118918305,
+        "image_mean": 0.8096785262829618,
+        "image_ci95": [
+          0.7913147533848226,
+          0.8274733203342964
+        ]
+      },
+      "mae": {
+        "patch_mean": 0.014081405727271295,
+        "patch_std": 0.010849695842311317,
+        "image_mean": 0.016502982169201333,
+        "image_ci95": [
+          0.015154568414274523,
+          0.018005109022621906
+        ]
+      }
+    },
+    "srcnn": {
+      "n_patches": 9902,
+      "n_images": 251,
+      "psnr": {
+        "patch_mean": 37.21797704949186,
+        "patch_std": 6.170699981134054,
+        "image_mean": 35.57651664070375,
+        "image_ci95": [
+          34.85391413133593,
+          36.32865518545634
+        ]
+      },
+      "ssim": {
+        "patch_mean": 0.8800831426095298,
+        "patch_std": 0.11855585039351575,
+        "image_mean": 0.8558400447523979,
+        "image_ci95": [
+          0.8398025392111623,
+          0.8707603081842289
+        ]
+      },
+      "mae": {
+        "patch_mean": 0.011593242350982103,
+        "patch_std": 0.009686105726229024,
+        "image_mean": 0.01364384467900929,
+        "image_ci95": [
+          0.012431807232066844,
+          0.015024532134681315
+        ]
+      }
+    },
+    "diffusion": {
+      "n_patches": 9902,
+      "n_images": 251,
+      "psnr": {
+        "patch_mean": 34.65329451017102,
+        "patch_std": 5.832415363348608,
+        "image_mean": 33.16456630429775,
+        "image_ci95": [
+          32.44925505015372,
+          33.86392277377677
+        ]
+      },
+      "ssim": {
+        "patch_mean": 0.8227606221410487,
+        "patch_std": 0.14514465415860586,
+        "image_mean": 0.7941515604143946,
+        "image_ci95": [
+          0.7755078433831833,
+          0.8118193179500806
+        ]
+      },
+      "mae": {
+        "patch_mean": 0.015409749004838623,
+        "patch_std": 0.01216286505868399,
+        "image_mean": 0.017867985047812632,
+        "image_ci95": [
+          0.016369955860646032,
+          0.01962215266217847
+        ]
+      }
+    },
+    "consistency": {
+      "n_patches": 9902,
+      "n_images": 251,
+      "psnr": {
+        "patch_mean": 35.59144956664523,
+        "patch_std": 5.8861047952602386,
+        "image_mean": 34.046209108998326,
+        "image_ci95": [
+          33.3342841106823,
+          34.75718813871836
+        ]
+      },
+      "ssim": {
+        "patch_mean": 0.8534117315820048,
+        "patch_std": 0.13431219906917374,
+        "image_mean": 0.8258562330103596,
+        "image_ci95": [
+          0.8078479155047665,
+          0.84247856464375
+        ]
+      },
+      "mae": {
+        "patch_mean": 0.013760544123490917,
+        "patch_std": 0.011076231820991576,
+        "image_mean": 0.01606472200813531,
+        "image_ci95": [
+          0.014668228120479515,
+          0.017667761697975248
+        ]
+      }
+    },
+    "consistency_2step": {
+      "n_patches": 9902,
+      "n_images": 251,
+      "psnr": {
+        "patch_mean": 36.671378981936705,
+        "patch_std": 5.771602511805748,
+        "image_mean": 35.10297624639549,
+        "image_ci95": [
+          34.41230023981,
+          35.818423673884276
+        ]
+      },
+      "ssim": {
+        "patch_mean": 0.8773653301608079,
+        "patch_std": 0.12004411185496892,
+        "image_mean": 0.8520988726204126,
+        "image_ci95": [
+          0.8356322560508856,
+          0.8675109716819148
+        ]
+      },
+      "mae": {
+        "patch_mean": 0.012192685636265684,
+        "patch_std": 0.009554387550389358,
+        "image_mean": 0.01424012205854853,
+        "image_ci95": [
+          0.013022897724217806,
+          0.015610795615728326
+        ]
+      }
+    },
+    "consistency_4step": {
+      "n_patches": 9902,
+      "n_images": 251,
+      "psnr": {
+        "patch_mean": 35.36481839059963,
+        "patch_std": 4.817092881751405,
+        "image_mean": 34.05267236217391,
+        "image_ci95": [
+          33.44385854760532,
+          34.658421710097734
+        ]
+      },
+      "ssim": {
+        "patch_mean": 0.8655869586525289,
+        "patch_std": 0.11835336601393226,
+        "image_mean": 0.8408038316410043,
+        "image_ci95": [
+          0.8246292745312709,
+          0.8560227610613362
+        ]
+      },
+      "mae": {
+        "patch_mean": 0.01377863982154184,
+        "patch_std": 0.008979753544457285,
+        "image_mean": 0.015677754845597452,
+        "image_ci95": [
+          0.014506364823001182,
+          0.016968852591222255
+        ]
+      }
+    },
+    "swin2sr": {
+      "n_patches": 9902,
+      "n_images": 251,
+      "psnr": {
+        "patch_mean": 37.11621935919602,
+        "patch_std": 6.158115569095503,
+        "image_mean": 35.483746614851995,
+        "image_ci95": [
+          34.75673862545894,
+          36.24567218733411
+        ]
+      },
+      "ssim": {
+        "patch_mean": 0.8796077918414034,
+        "patch_std": 0.12015385351499851,
+        "image_mean": 0.8550232179822141,
+        "image_ci95": [
+          0.8386822352699952,
+          0.870180599925288
+        ]
+      },
+      "mae": {
+        "patch_mean": 0.01150799061374773,
+        "patch_std": 0.009567558583293286,
+        "image_mean": 0.013536332299414285,
+        "image_ci95": [
+          0.012335042135488689,
+          0.014905405571328481
+        ]
+      }
+    }
+  }
+}
