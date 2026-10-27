@@ -12,6 +12,7 @@ dependencies = [
     "pillow>=12.3.0",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
+    "transformers>=5.20.2",
     "wandb>=0.30.0",
 ]
 

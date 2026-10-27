@@ -12,4 +12,4 @@ mkdir -p results
 
 source /home-mscluster/$USER/ORIon/.venv/bin/activate
 
-python scripts/patch_creator.py --downscale-factor 16
+python scripts/patch_creator.py --downscale-factor 4 --seed 42

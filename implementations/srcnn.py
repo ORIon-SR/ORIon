@@ -1,14 +1,18 @@
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
 from PIL import Image
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
+import wandb
 from dataloader import SRDataset
 from metrics import compute_ssim
 
@@ -124,6 +128,7 @@ def train(
     save_path: Path,
     preview_dir: Path,
     num_previews: int,
+    rank: int,
 ) -> None:
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -132,6 +137,7 @@ def train(
     patience_counter = 0
 
     for epoch in range(1, epochs + 1):
+        train_loader.sampler.set_epoch(epoch)
         model.train()
         train_loss = 0.0
         for lr_imgs, hr_imgs in train_loader:
@@ -167,81 +173,116 @@ def train(
         val_mae /= num_samples if num_samples > 0 else 1
         val_ssim /= num_samples if num_samples > 0 else 1
 
-        print(
-            f"Epoch {epoch}/{epochs} - "
-            f"Train Loss: {train_loss:.6f} - "
-            f"Val Loss: {val_loss:.6f} - "
-            f"Val MAE: {val_mae:.6f} - "
-            f"Val SSIM: {val_ssim:.6f}"
-        )
-
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/loss": train_loss,
-                "val/loss": val_loss,
-                "val/mae": val_mae,
-                "val/ssim": val_ssim,
-                "epochs_without_improvement": patience_counter,
-            },
-            step=epoch,
-        )
-
-        generate_previews(model, test_loader, device, preview_dir, num_previews, epoch)
-
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), save_path)
-            print(f"Saved best model (val_loss: {best_val_loss:.6f})")
+            if rank == 0:
+                torch.save(model.module.state_dict(), save_path)
+                print(f"Saved best model (val_loss: {best_val_loss:.6f})")
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
+
+        if rank == 0:
+            print(
+                f"Epoch {epoch}/{epochs} - "
+                f"Train Loss: {train_loss:.6f} - "
+                f"Val Loss: {val_loss:.6f} - "
+                f"Val MAE: {val_mae:.6f} - "
+                f"Val SSIM: {val_ssim:.6f} - "
+                f"Epochs w/o improvement: {patience_counter}"
+            )
+
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train/loss": train_loss,
+                    "val/loss": val_loss,
+                    "val/mae": val_mae,
+                    "val/ssim": val_ssim,
+                    "epochs_without_improvement": patience_counter,
+                },
+                step=epoch,
+            )
+
+            raw_model = model.module if isinstance(model, DDP) else model
+            generate_previews(raw_model, test_loader, device, preview_dir, num_previews, epoch)
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+
+def setup_ddp() -> tuple[int, int, torch.device]:
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    return rank, world_size, device
 
 
 def main() -> None:
+    project_root = Path(__file__).resolve().parent.parent
+    default_data_dir = project_root / "apod_data" / "dataset"
+
     parser = argparse.ArgumentParser(description="Train SRCNN for super-resolution")
-    parser.add_argument("--data-dir", type=Path, default="apod_data/dataset", help="Dataset root directory")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--data-dir", type=Path, default=default_data_dir, help="Dataset root directory")
+    parser.add_argument("--epochs", type=int, default=400, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU")
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
     parser.add_argument("--save-path", type=Path, default="checkpoints/srcnn_best.pth", help="Path to save best model")
     parser.add_argument("--preview-dir", type=Path, default="previews/scnn", help="Directory to save preview images")
     parser.add_argument("--num-previews", type=int, default=5, help="Number of preview samples to save")
-    parser.add_argument("--scaling-factor", type=int, default=16, help="Factor by which to upscale LR images")
+    parser.add_argument("--scaling-factor", type=int, default=4, help="Factor by which to upscale LR images")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (offset per rank)")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    rank, world_size, device = setup_ddp()
+    is_main = rank == 0
+    torch.manual_seed(args.seed + rank)
 
-    wandb.init(
-        project="ORIon-SR",
-        name="SR CNN",
-        config={
-            "epochs": args.epochs,
-            "lr": args.lr,
-            "batch_size": args.batch_size,
-            "patience": args.patience,
-            "device": str(device),
-        },
-    )
+    if is_main:
+        print(f"Using {world_size} GPUs")
+        wandb.init(
+            project="ORIon-SR",
+            name="SR CNN",
+            config={
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "patience": args.patience,
+                "device": str(device),
+                "world_size": world_size,
+            },
+        )
 
     train_dataset = SRDataset(args.data_dir, split="train")
     val_dataset = SRDataset(args.data_dir, split="val")
     test_dataset = SRDataset(args.data_dir, split="test")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=4, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=4, pin_memory=True
+    )
 
     model = SRCNN(upscale_factor=args.scaling_factor).to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    model = DDP(model, device_ids=[device.index])
 
-    args.save_path.parent.mkdir(parents=True, exist_ok=True)
-    args.preview_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+        args.save_path.parent.mkdir(parents=True, exist_ok=True)
+        args.preview_dir.mkdir(parents=True, exist_ok=True)
 
     train(
         model,
@@ -255,15 +296,18 @@ def main() -> None:
         args.save_path,
         args.preview_dir,
         args.num_previews,
+        rank,
     )
 
-    print(f"\nLoading best model from {args.save_path}")
-    raw_model = SRCNN()
-    raw_model.load_state_dict(torch.load(args.save_path, map_location=device, weights_only=True))
-    raw_model = raw_model.to(device)
-    generate_previews(raw_model, test_loader, device, args.preview_dir, args.num_previews, epoch=0)
+    if is_main:
+        print(f"\nLoading best model from {args.save_path}")
+        raw_model = SRCNN()
+        raw_model.load_state_dict(torch.load(args.save_path, map_location=device, weights_only=True))
+        raw_model = raw_model.to(device)
+        generate_previews(raw_model, test_loader, device, args.preview_dir, args.num_previews, epoch=0)
+        wandb.finish()
 
-    wandb.finish()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

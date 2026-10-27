@@ -1,14 +1,17 @@
 import argparse
 import math
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from PIL import Image
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 
 from dataloader import SRDataset
 from metrics import compute_ssim
@@ -32,6 +35,7 @@ class DDPMScheduler:
 
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        self.snr = self.alphas_cumprod / (1.0 - self.alphas_cumprod)
 
         self.posterior_variance = (
             self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
@@ -93,22 +97,23 @@ class ConditionalUNet(nn.Module):
             nn.SiLU(),
         )
 
-        self.in_conv = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
-        self.down1 = ResBlock(64, 128, time_dim)
-        self.pool1 = nn.Conv2d(128, 128, kernel_size=4, stride=2, padding=1)
+        self.in_conv = nn.Conv2d(in_channels, 128, kernel_size=3, padding=1)
+        self.down1 = ResBlock(128, 256, time_dim)
+        self.pool1 = nn.Conv2d(256, 256, kernel_size=4, stride=2, padding=1)
 
-        self.down2 = ResBlock(128, 256, time_dim)
-        self.pool2 = nn.Conv2d(256, 256, kernel_size=4, stride=2, padding=1)
+        self.down2 = ResBlock(256, 512, time_dim)
+        self.pool2 = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)
 
-        self.mid = ResBlock(256, 256, time_dim)
+        self.mid1 = ResBlock(512, 512, time_dim)
+        self.mid2 = ResBlock(512, 512, time_dim)
 
-        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
-        self.up_block2 = ResBlock(256, 128, time_dim)
+        self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)
+        self.up_block2 = ResBlock(768, 256, time_dim)
 
-        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
-        self.up_block1 = ResBlock(128, 64, time_dim)
+        self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
+        self.up_block1 = ResBlock(384, 128, time_dim)
 
-        self.out_conv = nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
+        self.out_conv = nn.Conv2d(128, out_channels, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
         t_emb = self.time_mlp(time)
@@ -119,7 +124,8 @@ class ConditionalUNet(nn.Module):
         x4 = self.down2(x3, t_emb)
         x5 = self.pool2(x4)
 
-        mid = self.mid(x5, t_emb)
+        mid = self.mid1(x5, t_emb)
+        mid = self.mid2(mid, t_emb)
 
         u2 = self.up2(mid)
         u2 = self.up_block2(torch.cat([u2, x4], dim=1), t_emb)
@@ -130,13 +136,16 @@ class ConditionalUNet(nn.Module):
         return self.out_conv(u1)
 
 
-def train_one_epoch(model, scheduler, dataloader, optimizer, device):
+def train_one_epoch(
+    model, scheduler, dataloader, optimizer, scaler, device, amp_dtype, min_snr_gamma=5.0
+):
     model.train()
     total_loss = 0.0
+    total_x0_mse = 0.0
 
-    for lr_imgs, hr_imgs in dataloader:
-        lr_imgs = lr_imgs.to(device)
-        hr_imgs = hr_imgs.to(device)
+    for batch_idx, (lr_imgs, hr_imgs) in enumerate(dataloader):
+        lr_imgs = lr_imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        hr_imgs = hr_imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
 
         hr_imgs = hr_imgs * 2.0 - 1.0
         lr_imgs = lr_imgs * 2.0 - 1.0
@@ -155,22 +164,48 @@ def train_one_epoch(model, scheduler, dataloader, optimizer, device):
         x_t = scheduler.add_noise(hr_imgs, noise, t)
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
-        pred_noise = model(model_input, t)
 
-        loss = F.mse_loss(pred_noise, noise)
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            pred_noise = model(model_input, t)
+
+        weights = (min_snr_gamma / scheduler.snr[t]).clamp(max=1.0)
+        loss = (weights[:, None, None, None] * (pred_noise.float() - noise) ** 2).mean()
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
+
+        # Matches validate's metric so the train/val loss pair is directly comparable
+        with torch.no_grad():
+            sqrt_alpha = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
+            sqrt_one_minus_alpha = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(
+                -1, 1, 1, 1
+            )
+            pred_x0 = (x_t - sqrt_one_minus_alpha * pred_noise.float()) / sqrt_alpha
+            x0_mse = F.mse_loss(pred_x0, hr_imgs)
 
         total_loss += loss.item()
+        total_x0_mse += x0_mse.item()
 
-    return total_loss / len(dataloader)
+        if dist.get_rank() == 0 and (batch_idx + 1) % 20 == 0:
+            print(
+                f"  Batch {batch_idx + 1}/{len(dataloader)} - "
+                f"Loss: {loss.item():.6f} (x0 MSE: {x0_mse.item():.6f})"
+            )
+
+    stats = torch.tensor(
+        [total_loss, total_x0_mse, float(len(dataloader))], device=device
+    )
+    dist.all_reduce(stats)
+    n = stats[2].item()
+    return stats[0].item() / n, stats[1].item() / n
 
 
 @torch.no_grad()
-def validate(model, scheduler, dataloader, device):
+def validate(model, scheduler, dataloader, device, amp_dtype, generator):
     model.eval()
     total_loss = 0.0
     total_ssim = 0.0
@@ -178,8 +213,8 @@ def validate(model, scheduler, dataloader, device):
     num_samples = 0
 
     for lr_imgs, hr_imgs in dataloader:
-        lr_imgs = lr_imgs.to(device)
-        hr_imgs = hr_imgs.to(device)
+        lr_imgs = lr_imgs.to(device, non_blocking=True)
+        hr_imgs = hr_imgs.to(device, non_blocking=True)
 
         hr_imgs_scaled = hr_imgs * 2.0 - 1.0
         lr_imgs_scaled = lr_imgs * 2.0 - 1.0
@@ -192,25 +227,27 @@ def validate(model, scheduler, dataloader, device):
         )
 
         t = torch.randint(
-            0, scheduler.num_timesteps, (batch_size,), device=device
-        ).long()
-        noise = torch.randn_like(hr_imgs_scaled)
+            0, scheduler.num_timesteps, (batch_size,), generator=generator
+        ).to(device)
+        noise = torch.randn(hr_imgs_scaled.shape, generator=generator).to(device)
         x_t = scheduler.add_noise(hr_imgs_scaled, noise, t)
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
-        pred_noise = model(model_input, t)
 
-        loss = F.mse_loss(pred_noise, noise)
-        total_loss += loss.item()
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            pred_noise = model(model_input, t)
 
+        pred_noise = pred_noise.float()
         sqrt_alpha_cumprod = scheduler.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
         sqrt_one_minus_alpha_cumprod = scheduler.sqrt_one_minus_alphas_cumprod[t].reshape(
             -1, 1, 1, 1
         )
-
         pred_x0 = (
             x_t - sqrt_one_minus_alpha_cumprod * pred_noise
         ) / sqrt_alpha_cumprod
+
+        loss = F.mse_loss(pred_x0, hr_imgs_scaled)
+        total_loss += loss.item()
 
         pred_x0_img = (pred_x0 + 1.0) / 2.0
         pred_x0_img = pred_x0_img.clamp(0, 1)
@@ -220,22 +257,39 @@ def validate(model, scheduler, dataloader, device):
             total_mae += F.l1_loss(pred_x0_img[i], hr_imgs[i]).item()
             num_samples += 1
 
-    avg_loss = total_loss / len(dataloader)
-    avg_ssim = total_ssim / num_samples if num_samples > 0 else 0.0
-    avg_mae = total_mae / num_samples if num_samples > 0 else 0.0
+    stats = torch.tensor(
+        [
+            total_loss,
+            total_ssim,
+            total_mae,
+            float(num_samples),
+            float(len(dataloader)),
+        ],
+        device=device,
+    )
+    dist.all_reduce(stats)
+
+    avg_loss = stats[0].item() / stats[4].item()
+    avg_ssim = stats[1].item() / stats[3].item() if stats[3].item() > 0 else 0.0
+    avg_mae = stats[2].item() / stats[3].item() if stats[3].item() > 0 else 0.0
 
     return avg_loss, avg_ssim, avg_mae
 
 
 @torch.no_grad()
 def sample_super_resolution(
-    model, scheduler, lr_img: torch.Tensor, target_size: tuple[int, int]
+    model,
+    scheduler,
+    lr_img: torch.Tensor,
+    target_size: tuple[int, int],
+    amp_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     model.eval()
     device = lr_img.device
 
+    lr_imgs_scaled = lr_img * 2.0 - 1.0
     lr_conditioned = F.interpolate(
-        lr_img, size=target_size, mode="bicubic", align_corners=False
+        lr_imgs_scaled, size=target_size, mode="bicubic", align_corners=False
     )
 
     x_t = torch.randn((1, 3, target_size[0], target_size[1]), device=device)
@@ -244,7 +298,10 @@ def sample_super_resolution(
         t = torch.full((1,), t_idx, device=device, dtype=torch.long)
 
         model_input = torch.cat([x_t, lr_conditioned], dim=1)
-        pred_noise = model(model_input, t)
+
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            pred_noise = model(model_input, t)
+        pred_noise = pred_noise.float()
 
         beta = scheduler.betas[t_idx]
         alpha = scheduler.alphas[t_idx]
@@ -271,15 +328,17 @@ def save_preview(
     save_path: Path,
     idx: int,
     epoch: int,
+    step: int,
+    commit: bool = False,
 ) -> None:
     def to_pil(tensor: torch.Tensor) -> Image.Image:
         arr = tensor.clamp(0, 1).mul(255).byte().cpu().numpy()
         arr = np.transpose(arr, (1, 2, 0))
         return Image.fromarray(arr)
 
-    lr_img = (lr_img + 1.0) / 2.0
+    lr_img = lr_img.clamp(0, 1)
     sr_img = (sr_img + 1.0) / 2.0
-    hr_img = (hr_img + 1.0) / 2.0
+    hr_img = hr_img.clamp(0, 1)
 
     lr_pil = to_pil(lr_img)
     sr_pil = to_pil(sr_img)
@@ -300,7 +359,8 @@ def save_preview(
                 combined, caption=f"LR | SR | HR - sample {idx} (epoch {epoch})"
             )
         },
-        step=epoch,
+        step=step,
+        commit=commit,
     )
 
 
@@ -312,14 +372,18 @@ def generate_previews(
     preview_dir: Path,
     num_previews: int,
     epoch: int,
+    amp_dtype: torch.dtype | None = None,
+    step: int | None = None,
+    commit: bool = False,
 ) -> None:
     model.eval()
     preview_count = 0
+    wandb_step = epoch if step is None else step
 
     with torch.no_grad():
         for lr_imgs, hr_imgs in test_loader:
-            lr_imgs = lr_imgs.to(device)
-            hr_imgs = hr_imgs.to(device)
+            lr_imgs = lr_imgs.to(device, non_blocking=True)
+            hr_imgs = hr_imgs.to(device, non_blocking=True)
 
             hr_size = hr_imgs.shape[-2:]
 
@@ -328,10 +392,17 @@ def generate_previews(
                     break
 
                 sr_img = sample_super_resolution(
-                    model, scheduler, lr_imgs[i : i + 1], hr_size
+                    model, scheduler, lr_imgs[i : i + 1], hr_size, amp_dtype
                 )
                 save_preview(
-                    lr_imgs[i], sr_img[0], hr_imgs[i], preview_dir, preview_count, epoch
+                    lr_imgs[i],
+                    sr_img[0],
+                    hr_imgs[i],
+                    preview_dir,
+                    preview_count,
+                    epoch,
+                    wandb_step,
+                    commit,
                 )
                 preview_count += 1
 
@@ -341,6 +412,17 @@ def generate_previews(
     print(
         f"Generated {preview_count} preview images for epoch {epoch} in {preview_dir}"
     )
+
+
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+def cleanup_ddp():
+    dist.destroy_process_group()
 
 
 def train(
@@ -356,52 +438,93 @@ def train(
     save_path: Path,
     preview_dir: Path,
     num_previews: int,
-) -> None:
+    rank: int,
+    train_sampler,
+    amp_dtype: torch.dtype | None,
+    min_snr_gamma: float = 5.0,
+) -> int:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=lr * 0.01
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
 
-    best_val_loss = float("inf")
+    best_val_ssim = 0.0
     patience_counter = 0
+    last_epoch = 0
+    val_generator = torch.Generator().manual_seed(0)
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, scheduler, train_loader, optimizer, device)
-        val_loss, val_ssim, val_mae = validate(model, scheduler, val_loader, device)
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), save_path)
-            print(f"Saved best model (val_loss: {best_val_loss:.6f})")
-        else:
-            patience_counter += 1
-
-        print(
-            f"Epoch {epoch}/{epochs} - "
-            f"Train Loss: {train_loss:.6f} - "
-            f"Val Loss: {val_loss:.6f} - "
-            f"Val MAE: {val_mae:.6f} - "
-            f"Val SSIM: {val_ssim:.6f} - "
-            f"Epochs w/o improvement: {patience_counter}"
+        last_epoch = epoch
+        train_sampler.set_epoch(epoch)
+        train_loss, train_x0_mse = train_one_epoch(
+            model, scheduler, train_loader, optimizer, scaler, device, amp_dtype,
+            min_snr_gamma
         )
-
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/loss": train_loss,
-                "val/loss": val_loss,
-                "val/mae": val_mae,
-                "val/ssim": val_ssim,
-                "epochs_without_improvement": patience_counter,
-            },
-            step=epoch,
+        val_generator.manual_seed(0)  # reset so t and noise are identical across epochs
+        val_x0_mse, val_ssim, val_mae = validate(
+            model, scheduler, val_loader, device, amp_dtype, val_generator
         )
+        lr_scheduler.step()
 
-        generate_previews(
-            model, scheduler, test_loader, device, preview_dir, num_previews, epoch
-        )
+        if rank == 0:
+            current_lr = lr_scheduler.get_last_lr()[0]
+            if val_ssim > best_val_ssim:
+                best_val_ssim = val_ssim
+                patience_counter = 0
+                torch.save(model.module.state_dict(), save_path)
+                print(f"Saved best model (val_ssim: {best_val_ssim:.6f})")
+            else:
+                patience_counter += 1
 
-        if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch}")
+            print(
+                f"Epoch {epoch}/{epochs} - "
+                f"Train Loss: {train_loss:.6f} (x0 MSE: {train_x0_mse:.6f}) - "
+                f"Val Loss: {val_x0_mse:.6f} - "
+                f"Val MAE: {val_mae:.6f} - "
+                f"Val SSIM: {val_ssim:.6f} - "
+                f"LR: {current_lr:.2e} - "
+                f"Epochs w/o improvement: {patience_counter}"
+            )
+
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train/loss": train_loss,
+                    "train/x0_mse": train_x0_mse,
+                    "val/x0_mse": val_x0_mse,
+                    "val/mae": val_mae,
+                    "val/ssim": val_ssim,
+                    "train/lr": current_lr,
+                    "epochs_without_improvement": patience_counter,
+                },
+                step=epoch,
+                commit=False,
+            )
+
+            generate_previews(
+                model,
+                scheduler,
+                test_loader,
+                device,
+                preview_dir,
+                num_previews,
+                epoch,
+                amp_dtype,
+            )
+
+        dist.barrier()
+
+        should_stop = torch.zeros(1, dtype=torch.int32, device=device)
+        if rank == 0:
+            should_stop[0] = int(patience_counter >= patience)
+        dist.broadcast(should_stop, src=0)
+        if should_stop.item() == 1:
+            if rank == 0:
+                print(f"Early stopping at epoch {epoch}")
             break
+
+    return last_epoch
 
 
 def main() -> None:
@@ -440,58 +563,121 @@ def main() -> None:
     parser.add_argument(
         "--num-timesteps", type=int, default=1000, help="Number of diffusion timesteps"
     )
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mixed precision (bf16 if supported, else fp16)",
+    )
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile the model with torch.compile()",
+    )
+    parser.add_argument(
+        "--min-snr-gamma",
+        type=float,
+        default=5.0,
+        help="Min-SNR-γ cap; ε-MSE weight is min(1, γ/SNR). Set very large for unweighted.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed (offset per rank)"
+    )
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-    wandb.init(
-        project="ORIon-SR",
-        name="Bicubic Diffusion",
-        config={
-            "epochs": args.epochs,
-            "lr": args.lr,
-            "batch_size": args.batch_size,
-            "patience": args.patience,
-            "num_timesteps": args.num_timesteps,
-            "device": str(device),
-        },
-    )
+    local_rank = setup_ddp()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{local_rank}")
+
+    torch.manual_seed(args.seed + rank)
+
+    amp_dtype = None
+    if args.amp:
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    if rank == 0:
+        print(f"Using device: {device}, World size: {world_size}")
+        print(f"AMP: {args.amp} (dtype: {amp_dtype}), torch.compile: {args.compile}")
+        print(f"Min-SNR gamma: {args.min_snr_gamma}, TF32: enabled")
+        wandb.init(
+            project="ORIon-SR",
+            name="Bicubic Diffusion DDP",
+            config={
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "patience": args.patience,
+                "num_timesteps": args.num_timesteps,
+                "world_size": world_size,
+                "device": str(device),
+                "amp": args.amp,
+                "amp_dtype": str(amp_dtype),
+                "compile": args.compile,
+                "min_snr_gamma": args.min_snr_gamma,
+                "seed": args.seed,
+            },
+        )
 
     train_dataset = SRDataset(args.data_dir, split="train")
     val_dataset = SRDataset(args.data_dir, split="val")
     test_dataset = SRDataset(args.data_dir, split="test")
 
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    val_sampler = DistributedSampler(
+        val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+    )
+    test_sampler = DistributedSampler(
+        test_dataset, num_replicas=world_size, rank=rank, shuffle=False
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
+        sampler=train_sampler,
+        num_workers=8,
         pin_memory=True,
+        persistent_workers=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
+        sampler=val_sampler,
+        num_workers=8,
         pin_memory=True,
+        persistent_workers=True,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
+        sampler=test_sampler,
+        num_workers=8,
         pin_memory=True,
+        persistent_workers=True,
     )
 
     scheduler = DDPMScheduler(num_timesteps=args.num_timesteps, device=str(device))
-    model = ConditionalUNet().to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    model = ConditionalUNet().to(memory_format=torch.channels_last).to(device)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    args.save_path.parent.mkdir(parents=True, exist_ok=True)
-    args.preview_dir.mkdir(parents=True, exist_ok=True)
+    if args.compile:
+        if rank == 0:
+            print("Compiling model with torch.compile()...")
+        model = torch.compile(model)
 
-    train(
+    if rank == 0:
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+        args.save_path.parent.mkdir(parents=True, exist_ok=True)
+        args.preview_dir.mkdir(parents=True, exist_ok=True)
+
+    epochs_run = train(
         model,
         scheduler,
         train_loader,
@@ -504,23 +690,32 @@ def main() -> None:
         args.save_path,
         args.preview_dir,
         args.num_previews,
+        rank,
+        train_sampler,
+        amp_dtype,
+        args.min_snr_gamma,
     )
 
-    print(f"\nLoading best model from {args.save_path}")
-    model.load_state_dict(
-        torch.load(args.save_path, map_location=device, weights_only=True)
-    )
-    generate_previews(
-        model,
-        scheduler,
-        test_loader,
-        device,
-        args.preview_dir,
-        args.num_previews,
-        epoch=0,
-    )
+    if rank == 0:
+        print(f"\nLoading best model from {args.save_path}")
+        model.module.load_state_dict(
+            torch.load(args.save_path, map_location=device, weights_only=True)
+        )
+        generate_previews(
+            model,
+            scheduler,
+            test_loader,
+            device,
+            args.preview_dir,
+            args.num_previews,
+            epoch=0,
+            amp_dtype=amp_dtype,
+            step=epochs_run + 1,
+            commit=True,
+        )
+        wandb.finish()
 
-    wandb.finish()
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
