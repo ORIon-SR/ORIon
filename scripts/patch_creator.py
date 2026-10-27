@@ -19,6 +19,7 @@ Usage:
 import argparse
 import os
 import sys
+import zlib
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -59,7 +60,10 @@ def select_patches(
     patch_size: int = 512,
     min_std: float = 15.0,
     max_attempts: int = 500,
+    rng: np.random.Generator | None = None,
 ) -> list[tuple[int, int]]:
+    if rng is None:
+        rng = np.random.default_rng()
     h, w = img_arr.shape[:2]
     if h < patch_size or w < patch_size:
         return []
@@ -74,8 +78,8 @@ def select_patches(
 
     while len(coords) < num_patches and attempts < max_attempts:
         attempts += 1
-        y = np.random.randint(0, max_y + 1) if max_y > 0 else 0
-        x = np.random.randint(0, max_x + 1) if max_x > 0 else 0
+        y = int(rng.integers(0, max_y + 1)) if max_y > 0 else 0
+        x = int(rng.integers(0, max_x + 1)) if max_x > 0 else 0
         coord = (y, x)
 
         if coord in seen:
@@ -90,8 +94,8 @@ def select_patches(
     max_fallback_attempts = 200
     while len(coords) < num_patches and fallback_attempts < max_fallback_attempts:
         fallback_attempts += 1
-        y = np.random.randint(0, max_y + 1) if max_y > 0 else 0
-        x = np.random.randint(0, max_x + 1) if max_x > 0 else 0
+        y = int(rng.integers(0, max_y + 1)) if max_y > 0 else 0
+        x = int(rng.integers(0, max_x + 1)) if max_x > 0 else 0
         coord = (y, x)
 
         if coord not in seen:
@@ -109,8 +113,13 @@ def _process_single_image(
     split_name: str,
     patch_size: int,
     downscale_factor: int | None,
+    seed: int = 0,
 ) -> tuple[int, int]:
-    """Process one image: extract patches and save them. Returns (patches_extracted, skipped)."""
+    """Process one image: extract patches and save them. Returns (patches_extracted, skipped).
+
+    The RNG is derived from (seed, image file name), so the patches of an image are the same
+    for any number of workers, any process start method and any processing order.
+    """
     hr_out = output_dir / split_name / "HR"
     lr_out = output_dir / split_name / "LR"
 
@@ -135,7 +144,8 @@ def _process_single_image(
         return 0, 1
 
     num_patches = patch_count(h, w)
-    patches = select_patches(img_arr, num_patches, patch_size=patch_size)
+    rng = np.random.default_rng([seed, zlib.crc32(img_path.name.encode("utf-8"))])
+    patches = select_patches(img_arr, num_patches, patch_size=patch_size, rng=rng)
     stem = img_path.stem
 
     count = 0
@@ -163,6 +173,7 @@ def process_split(
     patch_size: int,
     downscale_factor: int | None,
     num_workers: int,
+    seed: int = 0,
 ) -> int:
     hr_out = output_dir / split_name / "HR"
     hr_out.mkdir(parents=True, exist_ok=True)
@@ -176,7 +187,7 @@ def process_split(
     if num_workers == 1:
         for img_path, w, h in records:
             count, skip = _process_single_image(
-                img_path, w, h, output_dir, split_name, patch_size, downscale_factor
+                img_path, w, h, output_dir, split_name, patch_size, downscale_factor, seed
             )
             total += count
             skipped += skip
@@ -192,6 +203,7 @@ def process_split(
                     split_name,
                     patch_size,
                     downscale_factor,
+                    seed,
                 )
                 for img_path, w, h in records
             ]
@@ -244,7 +256,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None):
     args = parse_args(argv)
-    np.random.seed(args.seed)
 
     num_workers = args.num_workers if args.num_workers is not None else os.cpu_count()
     print(f"Using {num_workers} worker process(es)")
@@ -263,6 +274,7 @@ def main(argv: list[str] | None = None):
             args.patch_size,
             args.downscale_factor,
             num_workers,
+            args.seed,
         )
         grand_total += n
 

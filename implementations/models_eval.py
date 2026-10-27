@@ -363,6 +363,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=Path, default=Path("results/models_eval"))
     p.add_argument("--force", action="store_true", help="Overwrite existing results for this split")
     p.add_argument("--num-previews", type=int, default=5)
+    p.add_argument("--seed", type=int, default=0, help="Seed for the diffusion/consistency sampling noise")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", default="ORIon-SR")
     p.add_argument("--wandb-entity", default=None)
@@ -401,6 +402,8 @@ def load_model(name: str, args, device: torch.device):
 
 def main() -> None:
     args = parse_args()
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     torch.backends.cudnn.benchmark = True
