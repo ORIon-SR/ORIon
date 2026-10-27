@@ -37,22 +37,21 @@ discarded (and the discard count reported, per the proposal's provenance/data se
 How the minimum resolution is chosen (documented, not hard-coded silently)
 ----------------------------------------------------------------------------
   HR_PATCH_SIZE          : the side length (px) of the HR crop used to build LR/HR pairs.
-                            Default 128. The roadmap leaves this open between 128 and 256;
-                            128 is the safer default here because rungs (4) and (5) of the
+                            Default 512. The roadmap leaves this open between 128 and 512;
+                            512 is the safer default here because rungs (4) and (5) of the
                             SR ladder (diffusion, consistency) are the project's primary
-                            focus and are by far the most compute-hungry — a 128x128 HR /
-                            32x32 LR pair keeps every rung, including the generative ones,
-                            trainable on a free Colab GPU. Pass --hr-patch-size 256 to
-                            override once compute budget is confirmed (see roadmap: "Set
-                            hard compute budget ceiling before beginning the diffusion
-                            rung").
+                            focus — a 512x512 HR / 128x128 LR pair keeps every rung,
+                            including the generative ones, producing a non-trivial SR task.
+                            Pass --hr-patch-size 256 to reduce compute if needed (see
+                            roadmap: "Set hard compute budget ceiling before beginning the
+                            diffusion rung").
   DOWNSAMPLE_FACTOR       : fixed at 4, per the proposal's headline protocol. (The
                             secondary ×2/×8 sweep re-uses this same script with
                             --downsample-factor overridden, since the resolution filter
                             scales with it.)
   MIN_DIM_MULTIPLIER      : an image's shorter side must be >= MIN_DIM_MULTIPLIER x
                             HR_PATCH_SIZE to be kept. Default 2.0, i.e. minimum accepted
-                            resolution is 256x256 for the default 128px HR patch. A 1.0x
+                            resolution is 1024x1024 for the default 512px HR patch. A 1.0x
                             multiplier would only ever allow a single, fixed, centred HR
                             crop per image — no random-crop augmentation is possible, and
                             every rung would train on the exact same patch location every
@@ -838,7 +837,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--output-dir", default="./apod_data", help="Directory for outputs and cached images.")
     p.add_argument("--metadata-out", default="apod_metadata_filtered.csv", help="Filename for the kept-rows metadata table.")
     p.add_argument("--discarded-out", default="apod_discarded.csv", help="Filename for the discarded-rows log.")
-    p.add_argument("--hr-patch-size", type=int, default=128, help="HR crop side length in pixels (default 128; see module docstring).")
+    p.add_argument("--hr-patch-size", type=int, default=512, help="HR crop side length in pixels (default 512; see module docstring).")
     p.add_argument("--downsample-factor", type=int, default=4, help="Fixed SR factor per the proposal (default 4).")
     p.add_argument("--min-dim-multiplier", type=float, default=2.0, help="Minimum shorter-side = multiplier x HR patch size (default 2.0).")
     p.add_argument("--limit", type=int, default=None, help="Only process the first N rows (use for the --limit 200 test run).")

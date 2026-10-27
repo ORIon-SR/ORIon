@@ -236,8 +236,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--downscale-factor",
         type=int,
-        default=None,
-        help="If set, also produce LR patches by bicubic downsampling.",
+        default=4,
+        help="Bicubic downscale factor for LR patches (default 4, giving 128x128 LR from 512x512 HR).",
     )
     parser.add_argument(
         "--seed",
