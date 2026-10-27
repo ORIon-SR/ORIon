@@ -137,6 +137,7 @@ def train(
     patience_counter = 0
 
     for epoch in range(1, epochs + 1):
+        train_loader.sampler.set_epoch(epoch)
         model.train()
         train_loss = 0.0
         for lr_imgs, hr_imgs in train_loader:
@@ -234,11 +235,13 @@ def main() -> None:
     parser.add_argument("--save-path", type=Path, default="checkpoints/srcnn_best.pth", help="Path to save best model")
     parser.add_argument("--preview-dir", type=Path, default="previews/scnn", help="Directory to save preview images")
     parser.add_argument("--num-previews", type=int, default=5, help="Number of preview samples to save")
-    parser.add_argument("--scaling-factor", type=int, default=16, help="Factor by which to upscale LR images")
+    parser.add_argument("--scaling-factor", type=int, default=4, help="Factor by which to upscale LR images")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (offset per rank)")
     args = parser.parse_args()
 
     rank, world_size, device = setup_ddp()
     is_main = rank == 0
+    torch.manual_seed(args.seed + rank)
 
     if is_main:
         print(f"Using {world_size} GPUs")
@@ -259,7 +262,7 @@ def main() -> None:
     val_dataset = SRDataset(args.data_dir, split="val")
     test_dataset = SRDataset(args.data_dir, split="test")
 
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
